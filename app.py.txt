@@ -93,7 +93,7 @@ def _conn():
 
 def run(q, p=()):
     con = _conn()
-    try:
+try:
         con.execute(q, p)
         con.commit()
     except Exception as e:
@@ -103,7 +103,7 @@ def run(q, p=()):
 
 def fetch(q, p=()):
     con = _conn()
-    try:
+try:
         cur = con.execute(q, p)
         rows = cur.fetchall()
         return [dict(r) for r in rows]
@@ -220,7 +220,7 @@ def field_set(uid: str, key: str, value: dict):
 def field_get(uid: str, key: str, default=None):
     rows = fetch("SELECT value FROM field_state WHERE user_id=? AND key=?", (uid, key))
     if rows:
-        try:
+try:
             return json.loads(rows[0]["value"])
         except Exception:
             return default
@@ -296,7 +296,7 @@ def lens_schema_guard(obj: dict) -> dict:
 def parse_lens_file(upload) -> dict:
     text = ""
     name = upload.name
-    try:
+try:
         if name.lower().endswith(".txt"):
             text = upload.read().decode("utf-8", "ignore")
         elif name.lower().endswith(".docx") and docx:
@@ -328,7 +328,7 @@ def lenses_for_user(uid: str) -> Dict[str, dict]:
     rows = fetch("SELECT * FROM lenses WHERE user_id=?", (uid,))
     out = {"Core": CORE_LENS}
     for r in rows:
-        try:
+try:
             data = json.loads(r["data"])
             out[r["name"]] = {"name": r["name"], **lens_schema_guard(data)}
         except Exception:
@@ -562,7 +562,7 @@ def _linreg_posterior(X: np.ndarray, y: np.ndarray, alpha: float = 1.0, sigma2: 
     A = alpha * np.eye(d) + X.T @ X
     b = X.T @ y
 
-    try:
+try:
         Ainv = np.linalg.inv(A)
     except np.linalg.LinAlgError:
         Ainv = np.linalg.pinv(A)
@@ -586,7 +586,7 @@ def _get_arm_data(title: str):
     )
     X, y = [], []
     for r in rows:
-        try:
+try:
             v = json.loads(r["ctx"])
             rr = float(r["reward"])
             if isinstance(v, list) and len(v) > 0:
@@ -626,7 +626,7 @@ def bandit_scores(context_vec: list | np.ndarray, candidates_titles: list[str]) 
             continue
 
         mu, cov = _linreg_posterior(X, y, alpha=1.0, sigma2=0.35)
-        try:
+try:
             theta = np.random.multivariate_normal(mean=mu, cov=cov)
         except Exception:
             theta = mu
@@ -665,7 +665,7 @@ def ai_available():
 
 def set_openai_key(key: str):
     if ai_available():
-        try:
+try:
             openai.api_key = key
         except Exception:
             pass
@@ -688,7 +688,7 @@ Headwinds: {', '.join(drivers_neg or []) or '—'}
 Lens: {lens_line}
 Write one compact paragraph. Avoid generic advice; speak to the data.
 """
-    try:
+try:
         r = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[{"role":"system","content":sys},
@@ -911,10 +911,10 @@ with tabs[1]:
         # Context + bandit scores
         ctx_vec = context_vector(days_rows, goal_text, start)
         titles = [iv["title"] for iv in POOL]
-        try:
-        ctx_scores = bandit_scores(ctx_vec, titles)
+try:
+    ctx_scores = bandit_scores(ctx_vec, titles)
     except Exception:
-        ctx_scores = {t: 0.5 for t in titles}
+    ctx_scores = {t: 0.5 for t in titles}  # neutral fallback
 
         # Compute deltas: simply boost expected momentum by bandit score * small factor for demo
         base_focus_days = probs[:,0].sum()
@@ -996,10 +996,10 @@ with tabs[2]:
         ]
         titles = [p["title"] for p in POOL]
         ctx_vec = context_vector(days_rows, goal_text, start)
-        try:
-        scores = bandit_scores(ctx_vec, titles)
+try:
+    scores = bandit_scores(ctx_vec, titles)
     except Exception:
-        scores = {t: 0.5 for t in titles}
+    scores = {t: 0.5 for t in titles}  # neutral fallback
         ranked = sorted(POOL, key=lambda iv:-scores.get(iv["title"],0.5))
 
         # Top suggestion card
@@ -1232,7 +1232,7 @@ with tabs[6]:
         st.download_button("Download", data=json.dumps(dump, indent=2), file_name="timesculpt_export.json")
     imp = st.file_uploader("Import JSON", type=["json"])
     if imp and st.button("Import now"):
-        try:
+try:
             data = json.loads(imp.read().decode("utf-8"))
             # naive import: append rows (avoid dup keys)
             for r in data.get("days", []):
