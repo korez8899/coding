@@ -523,8 +523,34 @@ def estimate_eta_ribbon(expected_momentum_days: float, horizon: int = 30) -> Tup
     high = min(90, int(median*1.3))
     return (low, high)
 
+# ------------- CONTEXTUAL BANDIT (Linear Thompson) ----------
+def last7_avg_days(days_rows: List[dict], key: str) -> float:
+    vals=[]
+    for d in days_rows[-7:]:
+        eff = json.loads(d.get("eff_loops") or "{}")
+        vals.append(float(eff.get(key,0.0)))
+    return float(np.mean(vals)) if vals else 0.0
 
-# ---------- Contextual bandit (robust) ----------
+def goal_kind_flags(goal_text: str) -> List[float]:
+    g = (goal_text or "").lower()
+    return [
+        1.0 if any(w in g for w in ["write","book","essay","draft"]) else 0.0,
+        1.0 if any(w in g for w in ["fit","weight","walk","run","gym"]) else 0.0,
+        1.0 if any(w in g for w in ["save","invest","debt","money"]) else 0.0,
+        1.0 if any(w in g for w in ["learn","study","course","read"]) else 0.0,
+    ]
+
+def context_vector(days_rows: List[dict], goal_text: str, start_state: str) -> List[float]:
+    onehot = [0.0,0.0,0.0]; onehot[IDX.get(start_state,1)] = 1.0
+    sleep_g  = last7_avg_days(days_rows,"body:sleep_good")
+    late_slp = last7_avg_days(days_rows,"body:late_sleep")
+    scroll   = last7_avg_days(days_rows,"consumption:scroll")
+    exercise = last7_avg_days(days_rows,"body:exercise")
+    writing  = last7_avg_days(days_rows,"creation:writing")
+    gflags   = goal_kind_flags(goal_text)
+    focus_avg = np.mean([(d.get("focus",50) or 50) for d in days_rows[-7:]])/100.0 if days_rows else 0.5
+    return [1.0, *onehot, sleep_g/60.0, late_slp/60.0, scroll/60.0, exercise/60.0, writing/60.0, focus_avg, *gflags]
+
 
 def _linreg_posterior(X: np.ndarray, y: np.ndarray, alpha: float = 1.0, sigma2: float = 0.35):
     """ Bayesian ridge posterior for linear reward model.
@@ -533,11 +559,9 @@ def _linreg_posterior(X: np.ndarray, y: np.ndarray, alpha: float = 1.0, sigma2: 
     y = np.asarray(y, dtype=float).reshape(-1)
     d = X.shape[1]
 
-    # A = alpha*I + X^T X ; b = X^T y
     A = alpha * np.eye(d) + X.T @ X
     b = X.T @ y
 
-    # Safe inverse (falls back to pseudo-inverse)
     try:
         Ainv = np.linalg.inv(A)
     except np.linalg.LinAlgError:
@@ -546,7 +570,6 @@ def _linreg_posterior(X: np.ndarray, y: np.ndarray, alpha: float = 1.0, sigma2: 
     mu = Ainv @ b
     cov = sigma2 * Ainv
 
-    # Numerical floor (avoid negative/NaN on diagonals)
     cov = np.nan_to_num(cov, nan=0.0, posinf=1e3, neginf=0.0)
     for i in range(min(cov.shape[0], cov.shape[1])):
         if cov[i, i] < 1e-9:
@@ -577,14 +600,12 @@ def _get_arm_data(title: str):
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float).reshape(-1)
 
-    # guard: drop NaN rows
     ok = np.isfinite(X).all(axis=1) & np.isfinite(y)
     X = X[ok]
     y = y[ok]
     if X.size == 0 or y.size == 0:
         return None, None
 
-    # final guard: 2D shape
     if X.ndim == 1:
         X = X.reshape(-1, 1)
     return X, y
@@ -595,28 +616,22 @@ def bandit_scores(context_vec: list | np.ndarray, candidates_titles: list[str]) 
         Returns {title: score}. If no data for an arm → optimistic prior around 0.55. """
     x = np.asarray(context_vec, dtype=float).flatten()
     if not np.isfinite(x).all() or x.size == 0:
-        # as a last resort, provide a 1-dim neutral feature
         x = np.array([1.0], dtype=float)
 
     scores: dict[str, float] = {}
     for t in candidates_titles:
         X, y = _get_arm_data(t)
         if X is None:
-            # Optimistic prior encourages early exploration
             scores[t] = float(0.55 + np.random.normal(0.0, 0.05))
             continue
 
         mu, cov = _linreg_posterior(X, y, alpha=1.0, sigma2=0.35)
-
-        # Sample theta safely. If sampling fails, fall back to mean.
         try:
             theta = np.random.multivariate_normal(mean=mu, cov=cov)
         except Exception:
             theta = mu
 
         theta = np.asarray(theta, dtype=float).flatten()
-
-        # Align dimensions (truncate/pad) to avoid shape mismatches
         if theta.size != x.size:
             m = min(theta.size, x.size)
             if m == 0:
@@ -626,12 +641,23 @@ def bandit_scores(context_vec: list | np.ndarray, candidates_titles: list[str]) 
         else:
             val = float(np.dot(x, theta))
 
-        # Final sanitization
         if not np.isfinite(val):
             val = 0.5
         scores[t] = val
     return scores
 
+
+def log_intervention(uid: str, title: str, accepted=False, helped=None):
+    run("""INSERT INTO interventions_log(user_id,at,title,accepted,helped)
+           VALUES(?,?,?,?,?)""",
+        (uid, dt.datetime.now().isoformat(), title, int(bool(accepted)),
+         (None if helped is None else int(bool(helped)))))
+
+def log_intervention_ctx(uid: str, title: str, ctx_vec: List[float], helped=None):
+    run("""INSERT INTO interventions_log_ctx(user_id,at,title,ctx,reward)
+           VALUES(?,?,?, ?, ?)""",
+        (uid, dt.datetime.now().isoformat(), title, json.dumps(list(map(float,ctx_vec))),
+         (None if helped is None else (1.0 if helped else 0.0))))
 
 # ---------------------- AI HELPERS --------------------------
 def ai_available():
@@ -886,9 +912,9 @@ with tabs[1]:
         ctx_vec = context_vector(days_rows, goal_text, start)
         titles = [iv["title"] for iv in POOL]
         try:
-            ctx_scores = bandit_scores(ctx_vec, titles)
-        except Exception:
-            ctx_scores = {t: 0.5 for t in titles}
+        ctx_scores = bandit_scores(ctx_vec, titles)
+    except Exception:
+        ctx_scores = {t: 0.5 for t in titles}
 
         # Compute deltas: simply boost expected momentum by bandit score * small factor for demo
         base_focus_days = probs[:,0].sum()
@@ -971,9 +997,9 @@ with tabs[2]:
         titles = [p["title"] for p in POOL]
         ctx_vec = context_vector(days_rows, goal_text, start)
         try:
-            scores = bandit_scores(ctx_vec, titles)
-        except Exception:
-            scores = {t: 0.5 for t in titles}
+        scores = bandit_scores(ctx_vec, titles)
+    except Exception:
+        scores = {t: 0.5 for t in titles}
         ranked = sorted(POOL, key=lambda iv:-scores.get(iv["title"],0.5))
 
         # Top suggestion card
