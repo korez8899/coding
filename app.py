@@ -1,1356 +1,2405 @@
-# app.py — TimeSculpt (consolidated, single-file build)
-
-import os, json, math, random, datetime as dt, sqlite3, logging
-from typing import Dict, List, Tuple, Optional
-
-import numpy as np
-import pandas as pd
-import altair as alt
-import streamlit as st
-
-# Optional deps for lens upload
-try:
-    import docx  # python-docx
-except Exception:
-    docx = None
-try:
-    import PyPDF2
-except Exception:
-    PyPDF2 = None
-
-# Optional: bcrypt for PIN hashing
-try:
-    import bcrypt
-except Exception:
-    bcrypt = None
-
-# Optional AI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-try:
-    from openai import OpenAI
-    _openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-except Exception:
-    _openai_client = None
-
-# =========================
-# App Config & Visual Style
-# =========================
-
-st.set_page_config(page_title="TimeSculpt", layout="wide")
-st.markdown("""
-<style>
-/* Subtle dark theme polish */
-html, body, [class^="css"]  {
-  background-color: #0D0D10 !important;
-}
-h1, h2, h3 { color:#E0C36D; font-family: ui-serif, Georgia, serif; }
-section.main > div { padding-top: 0.25rem !important; }
-label, .stTextInput label, .stNumberInput label, .stSelectbox label { color:#E8E8EA !important; font-weight:600; }
-.stMetric { background: #141418; border: 1px solid #2a2a33; border-radius: 10px; padding: 6px 10px; }
-.card { border:1px solid #2a2a33; border-radius:10px; padding:12px; background:#111116; }
-.callout { border-left:3px solid #E0C36D; padding-left:10px; }
-.helper { color:#cfcfd6; font-size:0.9em; margin-top:-8px; margin-bottom:6px; }
-.badge { display:inline-block; font-size:0.8em; padding:2px 8px; border-radius:999px; border:1px solid #383842; color:#ddd; }
-.badge.good { border-color:#3d6; color:#9f9; }
-.badge.mid  { border-color:#cc4; color:#ff8; }
-.badge.low  { border-color:#d66; color:#f99; }
-.small { font-size:0.9em; color: #bdbdd0; }
-hr { border: none; border-top: 1px solid #22222a; margin: 0.6rem 0; }
-</style>
-""", unsafe_allow_html=True)
-
-# ==========
-# DB Layer
-# ==========
-
-DB = "timesculpt.db"
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
-
-def _conn():
-    c = sqlite3.connect(DB)
-    c.row_factory = lambda cur,row: {d[0]: row[i] for i,d in enumerate(cur.description)}
-    return c
-
-def run(q, p=(), commit=True):
-    try:
-        with _conn() as c:
-            cur = c.cursor()
-            cur.execute(q, p)
-            if commit: c.commit()
-            return True
-    except sqlite3.OperationalError as e:
-        logging.error(f"DB error: {e} in query: {q}")
-        return False
-
-def fetch(q, p=()):
-    try:
-        with _conn() as c:
-            return c.cursor().execute(q, p).fetchall()
-    except sqlite3.OperationalError as e:
-        logging.error(f"DB fetch error: {e} in query: {q}")
-        return []
-
-def init_db():
-    with _conn() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS profiles(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          name TEXT UNIQUE,
-          pin_hash BLOB
-        );
-        CREATE TABLE IF NOT EXISTS settings(
-          profile_id INTEGER, key TEXT, val TEXT,
-          PRIMARY KEY(profile_id,key)
-        );
-        CREATE TABLE IF NOT EXISTS days(
-          profile_id INTEGER, d TEXT, note TEXT, state TEXT,
-          focus REAL, energy REAL, progress REAL,
-          PRIMARY KEY(profile_id, d)
-        );
-        CREATE TABLE IF NOT EXISTS loops(
-          profile_id INTEGER, d TEXT, name TEXT, amount REAL, unit TEXT,
-          PRIMARY KEY(profile_id, d, name)
-        );
-        CREATE TABLE IF NOT EXISTS custom_loops(
-          profile_id INTEGER, name TEXT, category TEXT, polarity INTEGER,
-          unit TEXT, rate_label TEXT, rate_value REAL,
-          PRIMARY KEY(profile_id, name)
-        );
-        CREATE TABLE IF NOT EXISTS lens(
-          profile_id INTEGER, name TEXT, data TEXT,
-          PRIMARY KEY(profile_id, name)
-        );
-        CREATE TABLE IF NOT EXISTS lens_memory(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          profile_id INTEGER, at TEXT, lens_name TEXT, kind TEXT, phrase TEXT,
-          ctx TEXT
-        );
-        CREATE TABLE IF NOT EXISTS interventions_log(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          profile_id INTEGER, at TEXT, title TEXT, accepted INTEGER, helped INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS interventions_log_ctx(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          profile_id INTEGER, at TEXT, title TEXT, ctx TEXT, reward REAL
-        );
-        CREATE TABLE IF NOT EXISTS forecast_feedback(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          profile_id INTEGER, at TEXT, accurate INTEGER
-        );
-        """)
-        c.commit()
-
-init_db()
-
-# ------------
-# Profiles
-# ------------
-
-def list_profiles(): return fetch("SELECT * FROM profiles ORDER BY name ASC")
-def create_profile(name, pin=None):
-    pin_hash = None
-    if pin and bcrypt:
-        pin_hash = bcrypt.hashpw(pin.encode(), bcrypt.gensalt())
-    return run("INSERT INTO profiles(name,pin_hash) VALUES(?,?)", (name, pin_hash))
-
-def verify_pin(profile_id, pin) -> bool:
-    if not bcrypt or not pin: return True
-    row = fetch("SELECT pin_hash FROM profiles WHERE id=?", (profile_id,))
-    if not row or row[0]["pin_hash"] is None: return True
-    return bcrypt.checkpw(pin.encode(), row[0]["pin_hash"])
-
-def settings_get(pid, k, default=""):
-    r = fetch("SELECT val FROM settings WHERE profile_id=? AND key=?", (pid, k))
-    return r[0]["val"] if r else default
-
-def settings_set(pid,k,v):
-    return run("INSERT OR REPLACE INTO settings(profile_id,key,val) VALUES(?,?,?)", (pid,k,str(v)))
-
-# ------------
-# Lens system
-# ------------
-
-CORE_LENS = {
-    "name": "Core",
-    "collapse": [
-        "Release what drags the timeline.",
-        "Close the tab. End the loop.",
-        "No path opens while you hold every door."
-    ],
-    "recursion": [
-        "Repeat the action that proves the future.",
-        "Small loops compound into fate.",
-        "Consistency sculpts identity."
-    ],
-    "emergence": [
-        "Invite the first true move.",
-        "Bend toward the version of you that acts.",
-        "Begin poorly. Arrival happens mid-motion."
-    ],
-    "neutral": [
-        "Attend to what is here. Choose again."
-    ]
-}
-
-def strict_lens_schema(data: dict) -> Optional[dict]:
-    """Validate uploaded lens JSON -> normalized dict or None."""
-    if not isinstance(data, dict): return None
-    out = {"collapse": [], "recursion": [], "emergence": [], "neutral": []}
-    for k in out.keys():
-        arr = data.get(k, [])
-        if arr is None: arr = []
-        if not isinstance(arr, list): return None
-        clean = []
-        for x in arr:
-            if isinstance(x, str):
-                s = " ".join(x.split())
-                if len(s) >= 4:
-                    clean.append(s[:400])
-        out[k] = clean[:400]
-    return out
-
-def lens_put(pid, name, data_dict):
-    return run("INSERT OR REPLACE INTO lens(profile_id,name,data) VALUES(?,?,?)",
-               (pid, name.strip(), json.dumps(data_dict)))
-
-def lens_all(pid): return fetch("SELECT * FROM lens WHERE profile_id=?", (pid,))
-
-def get_all_lenses_dict(pid):
-    out = {"Core": CORE_LENS}
-    for r in lens_all(pid):
-        try:
-            d = json.loads(r["data"])
-            valid = strict_lens_schema(d)
-            if valid:
-                out[r["name"]] = {"name": r["name"], **valid}
-        except Exception:
-            continue
-    return out
-
-def log_lens_memory(pid, lens_name, kind, phrase, ctx):
-    run("INSERT INTO lens_memory(profile_id,at,lens_name,kind,phrase,ctx) VALUES(?,?,?,?,?,?)",
-        (pid, dt.datetime.now().isoformat(), lens_name, kind, phrase, json.dumps(ctx or {})))
-
-def lens_memory_recent(pid, limit=50):
-    return fetch("SELECT * FROM lens_memory WHERE profile_id=? ORDER BY id DESC LIMIT ?", (pid, limit))
-
-def smart_lens_line(pid, kind, ctx, primary_name, secondary_name=None, blend=0.0):
-    """Memory + context aware selection from one or blended lenses."""
-    all_lenses = get_all_lenses_dict(pid)
-    l1 = all_lenses.get(primary_name or "Core", CORE_LENS)
-    l2 = all_lenses.get(secondary_name, None) if secondary_name else None
-
-    def pool_for(lens, k):
-        return lens.get(k, []) or CORE_LENS.get(k, []) or []
-
-    pool1 = pool_for(l1, kind)
-    pool = pool1[:]
-    if l2 and blend > 0.0:
-        pool2 = pool_for(l2, kind)
-        # proportional blend; ensure presence
-        w2 = max(1, int(round(3 * float(blend))))
-        pool.extend(pool2 * w2)
-
-    if not pool:
-        return ""
-
-    # Anti-repetition by recent memory
-    recent = lens_memory_recent(pid, limit=12)
-    seen = {r["phrase"] for r in recent if r.get("kind") == kind}
-
-    candidates = [p for p in pool if p not in seen] or pool
-
-    # Context boost by goal words
-    goal = (ctx.get("goal") or "").lower()
-    weighted = []
-    for p in candidates:
-        sc = 1
-        if goal and any(w for w in goal.split() if w and w in p.lower()):
-            sc += 2
-        weighted.extend([p]*sc)
-
-    phrase = random.choice(weighted) if weighted else random.choice(candidates)
-    ln = (secondary_name if (l2 and blend > 0) else l1.get("name", "Core"))
-    log_lens_memory(pid, ln, kind, phrase, ctx)
-    return phrase
-
-# ------------
-# Units & Loops
-# ------------
-
-BUILTINS = [
-    # name, category, polarity(+1/-1), default unit, rate_label, rate_value
-    ("creation:writing",      "creation", +1, "minutes", "pages per minute", 1.0),
-    ("creation:project",      "creation", +1, "minutes", "weight (mins=mins)", 1.0),
-    ("mind:planning",         "mind",     +1, "minutes", "weight (mins=mins)", 1.0),
-    ("mind:reading",          "mind",     +1, "pages",   "pages per minute", 1.0),
-    ("mind:meditation",       "mind",     +1, "minutes", "weight (mins=mins)", 1.0),
-    ("body:walk",             "body",     +1, "minutes", "weight (mins=mins)", 1.0),
-    ("body:exercise",         "body",     +1, "minutes", "reps per minute",  10.0),
-    ("body:sleep_good",       "body",     +1, "hours",   "minutes per hour", 60.0),
-    ("body:late_sleep",       "body",     -1, "minutes", "weight (mins=mins)", 1.0),
-    ("consumption:scroll",    "consumption", -1, "minutes", "weight (mins=mins)", 1.0),
-    ("consumption:youtube",   "consumption", -1, "minutes", "weight (mins=mins)", 1.0),
-    ("food:junk",             "food",     -1, "servings", "mins per serving", 15.0),
-    ("finance:save_invest",   "finance",  +1, "pounds",  "£ per minute",     20.0),
-    ("finance:budget_check",  "finance",  +1, "minutes", "weight (mins=mins)", 1.0),
-    ("finance:impulse_spend", "finance",  -1, "pounds",  "£ per minute",     20.0),
-]
-
-def upsert_builtin_loops(pid):
-    have = {r["name"] for r in fetch("SELECT name FROM custom_loops WHERE profile_id=?", (pid,))}
-    for name,cat,pol,unit,rl,rv in BUILTINS:
-        if name not in have:
-            run("""INSERT OR REPLACE INTO custom_loops(profile_id,name,category,polarity,unit,rate_label,rate_value)
-                   VALUES(?,?,?,?,?,?,?)""", (pid,name,cat,pol,unit,rl,rv))
-
-def custom_loops_all(pid):
-    return fetch("SELECT * FROM custom_loops WHERE profile_id=? ORDER BY category,name", (pid,))
-
-def custom_loop_add(pid, name, category, polarity, unit, rate_label, rate_value):
-    if not name.strip(): return False
-    return run("""INSERT OR REPLACE INTO custom_loops(profile_id,name,category,polarity,unit,rate_label,rate_value)
-                  VALUES(?,?,?,?,?,?,?)""", (pid, name.strip(), category, int(polarity), unit, rate_label, float(rate_value)))
-
-def normalize_amount(row_name: str, amount: float, unit: str, overrides: Dict[str, Dict]) -> float:
-    """Return 'effective minutes' for scoring; uses per-loop unit calibration."""
-    if amount <= 0: return 0.0
-    o = overrides.get(row_name)
-    if not o:
-        # Fallback: 1 unit == 1 minute if unknown
-        return float(amount)
-    base_unit = o.get("unit", "minutes")
-    rate = float(o.get("rate_value", 1.0))
-    # Convert amount to minutes-equivalent by unit type
-    if unit == "minutes":
-        return float(amount)
-    if unit == "hours":
-        return float(amount) * 60.0
-    if unit == "pages":
-        # pages/minute => minutes = pages / (pages per minute)
-        ppm = max(0.1, rate)
-        return float(amount) / ppm
-    if unit == "reps":
-        # reps/min => minutes = reps / rpm
-        rpm = max(0.1, rate)
-        return float(amount) / rpm
-    if unit in ("pounds", "£"):
-        # £ per minute => minutes = pounds / rate
-        pounds_per_min = max(0.1, rate)
-        return float(amount) / pounds_per_min
-    if unit == "servings":
-        # minutes per serving => minutes = servings * rate
-        return float(amount) * max(0.0, rate)
-    # default fallback
-    return float(amount)
-
-# ------------
-# Days & Save
-# ------------
-
-def save_day(pid, d, note, loops_dict, units_dict, state, F, E, P):
-    run("INSERT OR REPLACE INTO days(profile_id,d,note,state,focus,energy,progress) VALUES(?,?,?,?,?,?,?)",
-        (pid, d, note, state, F, E, P))
-    # store raw loop amount + unit for transparency
-    for k, amt in loops_dict.items():
-        unit = units_dict.get(k, "minutes")
-        run("INSERT OR REPLACE INTO loops(profile_id,d,name,amount,unit) VALUES(?,?,?,?,?)",
-            (pid, d, k, float(amt), unit))
-
-def load_days(pid, n=180):
-    ds = fetch("SELECT * FROM days WHERE profile_id=? ORDER BY d ASC", (pid,))
-    ls = fetch("SELECT * FROM loops WHERE profile_id=?", (pid,))
-    by = {}
-    for r in ls:
-        by.setdefault((r["d"]), {})[r["name"]] = {"amount": r["amount"], "unit": r.get("unit") or "minutes"}
-    days = []
-    for d in ds:
-        key = d["d"]
-        d["loops_raw"] = by.get(key, {})
-        days.append(d)
-    return days[-n:] if n else days
-
-def undo_last_commit(pid):
-    rows = fetch("SELECT d FROM days WHERE profile_id=? ORDER BY d DESC LIMIT 1", (pid,))
-    if not rows: return False
-    d = rows[0]["d"]
-    run("DELETE FROM days WHERE profile_id=? AND d=?", (pid, d))
-    run("DELETE FROM loops WHERE profile_id=? AND d=?", (pid, d))
-    return True
-
-# ------------
-# State Model
-# ------------
-
-W_POS, W_NEG, W_PROG, W_ENER = 0.8, 0.9, 0.25, 0.15
-STATES = ["Focused", "Mixed", "Drift"]
-IDX = {s:i for i,s in enumerate(STATES)}
-
-def label_state(loops_eff: Dict[str, float], pos_keys: set, neg_keys: set):
-    posm = sum(loops_eff.get(k, 0.0) for k in pos_keys)
-    negm = sum(loops_eff.get(k, 0.0) for k in neg_keys)
-
-    energy = min(100.0, (
-        loops_eff.get("body:walk", 0.0)*1.2 +
-        loops_eff.get("body:exercise", 0.0)*1.6 +
-        loops_eff.get("body:sleep_good", 0.0)*0.8
-    ) / 2.0)
-
-    progress = min(100.0, (
-        loops_eff.get("creation:writing", 0.0)*1.4 +
-        loops_eff.get("creation:project", 0.0)*1.2 +
-        loops_eff.get("finance:save_invest", 0.0)*1.1 +
-        loops_eff.get("mind:planning", 0.0)*0.9
-    ))
-
-    focus_raw = (posm * W_POS - negm * W_NEG) + progress * W_PROG + energy * W_ENER
-    focus = max(0.0, min(100.0, focus_raw))
-
-    if negm > posm * 1.2 or loops_eff.get("consumption:scroll", 0.0) >= 45:
-        state = "Drift"
-    elif posm >= negm and (loops_eff.get("creation:writing", 0.0) + loops_eff.get("creation:project", 0.0)) >= 30:
-        state = "Focused"
-    else:
-        state = "Mixed"
-
-    contribs = []
-    for k in pos_keys:
-        m = loops_eff.get(k, 0.0)
-        if m > 0: contribs.append((k, m*W_POS, m))
-    for k in neg_keys:
-        m = loops_eff.get(k, 0.0)
-        if m > 0: contribs.append((k, -m*W_NEG, m))
-
-    pos_sorted = sorted([c for c in contribs if c[1] > 0], key=lambda x: -x[1])[:2]
-    neg_sorted = sorted([c for c in contribs if c[1] < 0], key=lambda x: abs(x[1]), reverse=True)[:2]
-
-    def fmt_pos(c): return f"+{int(c[2])}m {c[0].split(':',1)[1]} (impact +{c[1]:.1f})"
-    def fmt_neg(c): return f"-{int(c[2])}m {c[0].split(':',1)[1]} (impact {c[1]:.1f})"
-    plus  = ", ".join(fmt_pos(c) for c in pos_sorted) if pos_sorted else "+0m"
-    minus = ", ".join(fmt_neg(c) for c in neg_sorted) if neg_sorted else "-0m"
-    micro = f"{plus} | {minus}"
-
-    return state, round(focus,1), round(energy,1), round(progress,1), micro
-
-# ------------
-# Forecast (Dirichlet calibration + adaptive sims)
-# ------------
-
-DECAY = 0.97
-PRIOR_WEIGHT = 0.5
-UNIFORM_BLEND = 0.08
-
-def learn_matrix(days, decay=DECAY):
-    C = np.ones((3,3)) * PRIOR_WEIGHT
-    last = None; w = 1.0
-    for d in days:
-        s = d.get("state")
-        if s not in IDX: continue
-        if last is not None:
-            C[IDX[last], IDX[s]] += w
-        w *= decay
-        last = s
-    M = C / C.sum(axis=1, keepdims=True)
-    U = np.ones((3,3))/3.0
-    M = (1-UNIFORM_BLEND)*M + UNIFORM_BLEND*U
-    M = np.maximum(1e-6, M)
-    return M / M.sum(axis=1, keepdims=True)
-
-def entropy_of_matrix(M):
-    # average row entropy (0..~1.1)
-    ent = 0.0
-    for i in range(M.shape[0]):
-        p = M[i] + 1e-9
-        ent += -np.sum(p*np.log(p))
-    return ent / M.shape[0]
-
-def adaptive_sims(M):
-    ent = entropy_of_matrix(M)
-    # low entropy → fewer sims; higher entropy → more sims
-    return int(np.clip(800 + 2000*(ent/1.1), 800, 3000))
-
-def simulate(M, start_state, days=30, sims=1500):
-    start = IDX.get(start_state, 1)
-    counts = np.zeros((days, 3))
-    for _ in range(sims):
-        s = start
-        for t in range(days):
-            counts[t, s] += 1
-            s = np.random.choice([0,1,2], p=M[s])
-    probs = counts / sims
-    exp_focus = probs[:,0].sum()
-    return probs, float(exp_focus)
-
-def calibrate_matrix(M, pid):
-    """Dirichlet posterior from real transitions + feedback nudges."""
-    days = load_days(pid, 120)
-    alpha = np.ones((3,3)) * PRIOR_WEIGHT
-    last = None; w = 1.0
-    for d in days:
-        s = d.get("state")
-        if s not in IDX: continue
-        if last is not None:
-            alpha[IDX[last], IDX[s]] += w
-        w *= DECAY
-        last = s
-
-    fb = fetch("SELECT accurate FROM forecast_feedback WHERE profile_id=?", (pid,))
-    good = sum(1 for r in fb if int(r["accurate"] or 0) == 1)
-    bad  = sum(1 for r in fb if int(r["accurate"] or 0) == 0)
-
-    boost = 1.0 + 0.01*good
-    damp  = 1.0 + 0.01*bad
-
-    for i in range(3):
-        alpha[i,i] *= boost
-        for j in range(3):
-            if j!=i: alpha[i,j] /= damp
-
-    M2 = alpha / alpha.sum(axis=1, keepdims=True)
-    U = np.ones((3,3))/3.0
-    M2 = (1-UNIFORM_BLEND)*M2 + UNIFORM_BLEND*U
-
-    # Confidence badge from KL-divergence between prior M and calibrated M2
-    eps = 1e-9
-    kl = 0.0
-    for i in range(3):
-        p = M[i]  + eps
-        q = M2[i] + eps
-        kl += np.sum(p * np.log(p/q))
-    kl /= 3.0
-    if kl > 0.05: conf = "High"
-    elif kl > 0.02: conf = "Medium"
-    else: conf = "Low"
-    return (M2 / M2.sum(axis=1, keepdims=True)), conf
-
-# ------------
-# Interventions (pool + contextual bandit)
-# ------------
-
-def interventions_pool(goal_text: str):
-    gl = (goal_text or "").lower()
-    finance_goal = any(w in gl for w in ["save","invest","debt","money","budget"])
-    writing_goal = any(w in gl for w in ["write","book","essay","draft"])
-    fitness_goal = any(w in gl for w in ["walk","run","gym","weight"])
-
-    pool = [
-        {"title":"7-min starter", "how":"Start badly. Stop after 7.", "tags":["creation"], "tweak":{"m_to_f":+0.05}},
-        {"title":"15-min walk", "how":"Swap one scroll for a short walk.", "tags":["body"], "tweak":{"m_to_f":+0.05, "d_self":-0.03}},
-        {"title":"Sleep before midnight", "how":"Shutdown 30 min earlier.", "tags":["body"], "tweak":{"d_self":-0.06}},
-        {"title":"10% pay-yourself-first", "how":"Automate a standing order.", "tags":["finance"], "tweak":{"m_to_f":+0.05}},
-    ]
-    # Bias pool by goal
-    if finance_goal:
-        pool.append({"title":"Budget check (5m)","how":"Scan top 3 expenses.","tags":["finance"],"tweak":{"m_to_f":+0.03}})
-    if writing_goal:
-        pool.append({"title":"1 paragraph now","how":"Just 3 sentences.","tags":["creation"],"tweak":{"m_to_f":+0.04}})
-    if fitness_goal:
-        pool.append({"title":"Pushups x20","how":"Do them next.","tags":["body"],"tweak":{"m_to_f":+0.03, "d_self":-0.02}})
-    return pool
-
-def tweak_matrix(M, **kwargs):
-    A = M.copy()
-    def adj_row(i, d):
-        A[i] = np.maximum(0.001, A[i] + d)
-        A[i] /= A[i].sum()
-    if kwargs.get("d_self"): adj_row(IDX["Drift"], np.array([0,0,kwargs["d_self"]]))
-    if kwargs.get("d_to_m"):  adj_row(IDX["Drift"], np.array([0,kwargs["d_to_m"],0]))
-    if kwargs.get("m_to_f"):  adj_row(IDX["Mixed"], np.array([kwargs["m_to_f"],0,0]))
-    if kwargs.get("f_self"):  adj_row(IDX["Focused"], np.array([kwargs["f_self"],0,0]))
-    return A
-
-def log_intervention(pid, title, accepted=False, helped=None):
-    run("INSERT INTO interventions_log(profile_id,at,title,accepted,helped) VALUES(?,?,?,?,?)",
-        (pid, dt.datetime.now().isoformat(), title, int(bool(accepted)),
-         (None if helped is None else int(bool(helped)))))
-
-def log_intervention_ctx(pid, title, ctx_vec, helped=None):
-    run("INSERT INTO interventions_log_ctx(profile_id,at,title,ctx,reward) VALUES(?,?,?,?,?)",
-        (pid, dt.datetime.now().isoformat(), title, json.dumps(list(map(float,ctx_vec))),
-         (None if helped is None else (1.0 if helped else 0.0))))
-
-def last7_avg(days, key):
-    vals=[]
-    for d in days[-7:]:
-        loops = d.get("loops_eff") or {}
-        vals.append(float(loops.get(key,0.0)))
-    return float(np.mean(vals)) if vals else 0.0
-
-def goal_kind_flags(goal_text:str):
-    g=(goal_text or "").lower()
-    return [
-        1.0 if any(w in g for w in ["write","book","essay","draft"]) else 0.0,
-        1.0 if any(w in g for w in ["fit","weight","walk","run","gym"]) else 0.0,
-        1.0 if any(w in g for w in ["save","invest","debt","money"]) else 0.0,
-        1.0 if any(w in g for w in ["learn","study","course","read"]) else 0.0,
-    ]
-
-def current_context_vec(days, goal_text, start_state):
-    onehot = [0.0,0.0,0.0]; onehot[IDX.get(start_state,1)] = 1.0
-    sleep_g  = last7_avg(days,"body:sleep_good")
-    late_slp = last7_avg(days,"body:late_sleep")
-    scroll   = last7_avg(days,"consumption:scroll")
-    exercise = last7_avg(days,"body:exercise")
-    writing  = last7_avg(days,"creation:writing")
-    gflags   = goal_kind_flags(goal_text)
-    return [
-        1.0, *onehot,
-        sleep_g/60.0, late_slp/60.0, scroll/60.0, exercise/60.0, writing/60.0,
-        np.mean([d.get("focus",50.0) for d in days[-7:]])/100.0,
-        *gflags
-    ]
-
-def _linreg_posterior(X, y, alpha=1.0, sigma2=0.35):
-    d = X.shape[1]
-    A = alpha*np.eye(d) + X.T @ X
-    b = X.T @ y
-    try: Ainv = np.linalg.inv(A)
-    except np.linalg.LinAlgError: Ainv = np.linalg.pinv(A)
-    mu = Ainv @ b
-    cov = sigma2 * Ainv
-    return mu, cov
-
-def _get_arm_data(pid, title):
-    rows = fetch("SELECT ctx, reward FROM interventions_log_ctx WHERE profile_id=? AND title=? AND reward IS NOT NULL",
-                 (pid, title))
-    X=[]; y=[]
-    for r in rows:
-        try:
-            v = json.loads(r["ctx"]); rr = float(r["reward"])
-            if isinstance(v, list):
-                X.append(v); y.append(rr)
-        except Exception:
-            continue
-    if not X: return None, None
-    return np.array(X, dtype=float), np.array(y, dtype=float)
-
-def bandit_context_scores(pid, context_vec, titles):
-    x = np.array(context_vec, dtype=float).reshape(1,-1)
-    scores={}
-    for t in titles:
-        X,y = _get_arm_data(pid, t)
-        if X is None:
-            scores[t] = 0.55 + np.random.normal(0, 0.05)  # optimistic prior
-            continue
-        mu, cov = _linreg_posterior(X,y)
-        try:
-            theta = np.random.multivariate_normal(mu, cov)
-        except Exception:
-            theta = mu
-        scores[t] = float(x @ theta)[0]
-    return scores
-
-# ------------
-# AI helpers
-# ------------
-
-def ai_available(): return _openai_client is not None
-
-def safe_ai_call(prompt: str, system: str = "You are a concise coach."):
-    if not ai_available(): return None
-    try:
-        resp = _openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.5,
-            messages=[{"role":"system","content":system},{"role":"user","content":prompt}]
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception:
-        return None
-
-def ai_narrate_forecast_rich(goal, start_state, focused_days, likelihood_mid, likelihood_band,
-                             required_pace_delta, milestones, top_move, top_move_delta,
-                             alt_upside, drivers_pos, drivers_neg):
-    sys = "You turn behavioral forecasts into one crisp paragraph. Be concrete and motivational without fluff."
-    lo, hi = likelihood_band
-    parts = [
-        f"Goal: {goal or '—'}.",
-        f"Expected focused days: {focused_days:.1f}/30.",
-        f"Chance to hit plan: {likelihood_mid:.0%} (range {lo:.0%}–{hi:.0%}).",
-    ]
-    if required_pace_delta > 0.05:
-        parts.append(f"To keep pace, add ~{required_pace_delta:.1f} units daily.")
-    if milestones:
-        parts.append(f"Near-term milestones: {', '.join(milestones[:2])}.")
-    if drivers_pos: parts.append(f"Tailwinds: {', '.join(drivers_pos[:2])}.")
-    if drivers_neg: parts.append(f"Headwinds: {', '.join(drivers_neg[:2])}.")
-    parts.append(f"Smallest move now: {top_move} (≈ +{top_move_delta:.2f} days).")
-
-    prompt = " ".join(parts) + " Rewrite into one tight paragraph in plain language."
-    out = safe_ai_call(prompt, sys)
-    return out
-
-def local_narrate_forecast(goal: str, start_state: str, focused_days: float,
-                           likelihood_mid: float, likelihood_band: tuple,
-                           required_pace_delta: float, unit_label: str,
-                           milestones: list, drivers_pos: list, drivers_neg: list,
-                           top_move_title: str, top_move_delta: float) -> str:
-    lo, hi = likelihood_band
-    parts = []
-    if goal: parts.append(f"Goal: **{goal}**.")
-    parts.append(f"Next 30 days: **{focused_days:.1f}** focused days expected.")
-    parts.append(f"Chance of hitting plan: **{likelihood_mid:.0%}** (range {lo:.0%}–{hi:.0%}).")
-    if required_pace_delta > 0.1:
-        parts.append(f"To stay on track: add ~**{required_pace_delta:.1f} {unit_label}** daily.")
-    if milestones:  parts.append(f"Near-term milestones: _{', '.join(milestones[:2])}_.")
-    if drivers_pos: parts.append(f"Tailwinds: {', '.join(drivers_pos[:2])}.")
-    if drivers_neg: parts.append(f"Headwinds: {', '.join(drivers_neg[:2])}.")
-    if top_move_title:
-        parts.append(f"Smallest move now: **{top_move_title}** (≈ +{top_move_delta:.2f} days).")
-    return " ".join(parts)
-
-# =========================
-# Sidebar: Profiles & Nav
-# =========================
-
-with st.sidebar:
-    st.title("TimeSculpt")
-    # AI toggle
-    USE_AI = st.toggle("AI narration", value=False, help="Turn on to get AI-written briefs. Off = local narration.")
-    st.divider()
-
-    # Profiles
-    profs = list_profiles()
-    prof_names = ["(create new)"] + [p["name"] for p in profs]
-    sel = st.selectbox("Profile", prof_names, index=(1 if profs else 0))
-    if sel == "(create new)":
-        with st.expander("Create profile"):
-            n = st.text_input("Name")
-            p = st.text_input("Optional PIN", type="password")
-            if st.button("Create"):
-                if create_profile(n, p): st.success("Profile created. Select it above."); st.experimental_rerun()
-                else: st.error("Failed to create profile (name may exist).")
-        pid = None
-    else:
-        pid = [p for p in profs if p["name"] == sel][0]["id"]
-        # Optional PIN gate
-        row = fetch("SELECT pin_hash FROM profiles WHERE id=?", (pid,))
-        need_pin = row and row[0]["pin_hash"] is not None
-        if need_pin:
-            pin_try = st.text_input("PIN", type="password")
-            if st.button("Unlock") and not verify_pin(pid, pin_try):
-                st.error("Wrong PIN.")
-                pid = None
-
-    st.divider()
-    tabs = ["Input","Forecast","Interventions","Diagnostics","Lens","Lens Memory","Export/Import","Help"]
-    tab = st.radio("Navigate", tabs, index=0)
-
-# Protect UI if no profile
-if not pid:
-    st.info("Create or unlock a profile to begin.")
-    st.stop()
-
-# Ensure builtins in custom_loops
-upsert_builtin_loops(pid)
-
-# Sticky header
-days_all = load_days(pid, 365)
-st.markdown("<div style='position:sticky;top:0;background:#0d0d10e6;border-bottom:1px solid #222;padding:.35rem 0;z-index:50'>", unsafe_allow_html=True)
-hdr = f"<span class='badge'>Profile: {sel}</span> "
-if days_all:
-    last = days_all[-1]
-    hdr += f"&nbsp;&nbsp;<b>Today:</b> {last['state']} • Focus {last['focus']:.0f} • Energy {last['energy']:.0f} • Progress {last['progress']:.0f}"
-else:
-    hdr += "&nbsp;&nbsp;<b>Today:</b> no data yet"
-st.markdown(hdr, unsafe_allow_html=True)
-st.markdown("</div>", unsafe_allow_html=True)
-
-# =============
-# INPUT TAB
-# =============
-if tab == "Input":
-    st.header("Daily Input")
-    goal = st.text_input("Objective / Goal", value=settings_get(pid,"goal",""))
-    if st.button("Save goal"): settings_set(pid,"goal",goal); st.success("Goal saved.")
-    st.caption("Tip: your interventions and narration are biased toward this objective.")
-
-    # Custom loops table + builder
-    st.subheader("Your Loops")
-    loops_meta = custom_loops_all(pid)
-    meta_map = {r["name"]: r for r in loops_meta}
-
-    with st.expander("Add or calibrate a loop"):
-        c1,c2,c3 = st.columns(3)
-        with c1: new_name = st.text_input("Name (e.g., reading)")
-        with c2: new_cat  = st.selectbox("Category", ["creation","mind","body","consumption","food","finance"])
-        with c3: new_pol  = st.selectbox("Polarity", [+1,-1], format_func=lambda x: "Positive (+)" if x>0 else "Negative (−)")
-        c4,c5,c6 = st.columns(3)
-        with c4: new_unit = st.selectbox("Unit", ["minutes","hours","pages","reps","servings","pounds","£"])
-        with c5: rate_label = st.text_input("Rate label", value=("pages per minute" if new_unit=="pages" else "weight (mins=mins)"))
-        with c6: rate_value = st.number_input("Rate value", min_value=0.01, max_value=9999.0, value=1.0, step=0.1)
-
-        if st.button("Add/Update loop"):
-            ok = custom_loop_add(pid, f"{new_cat}:{new_name}", new_cat, new_pol, new_unit, rate_label, rate_value)
-            if ok: st.success("Loop saved."); st.experimental_rerun()
-            else:  st.error("Loop save failed.")
-
-    # Inputs for today
-    d = st.date_input("Date", value=dt.date.today()).isoformat()
-    st.caption("Enter values; the system normalizes units to effective minutes for scoring.")
-
-    # Prepare fields in a grid
-    names_sorted = sorted(meta_map.keys())
-    cols = st.columns(4)
-    loops_amount, loops_unit = {}, {}
-    for i, name in enumerate(names_sorted):
-        row = meta_map[name]
-        label = f"{name.split(':',1)[1].title()}"
-        with cols[i%4]:
-            amt = st.number_input(label, min_value=0.0, max_value=9999.0, value=0.0, step=1.0, key=f"amt_{name}")
-            unit = st.selectbox("unit", ["minutes","hours","pages","reps","servings","pounds","£"], index=["minutes","hours","pages","reps","servings","pounds","£"].index(row["unit"]) if row["unit"] in ["minutes","hours","pages","reps","servings","pounds","£"] else 0, key=f"unit_{name}")
-            st.markdown(f"<div class='helper'>Calib: {row['rate_label']} = <b>{row['rate_value']}</b></div>", unsafe_allow_html=True)
-            loops_amount[name] = amt
-            loops_unit[name]   = unit
-
-    # Normalize to effective minutes and label state
-    # Build pos/neg sets
-    pos_keys = {r["name"] for r in loops_meta if int(r["polarity"]) > 0}
-    neg_keys = {r["name"] for r in loops_meta if int(r["polarity"]) < 0}
-    overrides = {r["name"]: r for r in loops_meta}
-
-    loops_eff = {}
-    for k, amt in loops_amount.items():
-        loops_eff[k] = normalize_amount(k, amt, loops_unit.get(k,"minutes"), overrides)
-
-    state, F, E, P, micro = label_state(loops_eff, pos_keys, neg_keys)
-    st.info(f"**{state}** • Focus {F} • Energy {E} • Progress {P}\n\n{micro}")
-
-    note = st.text_area("Note (optional)")
-    c1,c2 = st.columns(2)
-    with c1:
-        if st.button("Commit today"):
-            # Attach normalized loops to days (also store raw w/ unit)
-            day_record = {"loops_eff": loops_eff}
-            save_day(pid, d, note, loops_amount, loops_unit, state, F, E, P)
-            st.success("Saved.")
-    with c2:
-        if st.button("Undo last commit"):
-            if undo_last_commit(pid): st.success("Undone."); st.experimental_rerun()
-            else: st.info("Nothing to undo.")
-
-# =============
-# FORECAST TAB
-# =============
-elif tab == "Forecast":
-    st.header("30-Day Forecast")
-
-    days = load_days(pid, 180)
-    if not days:
-        st.info("Log at least 1 day to unlock forecast.")
-        st.stop()
-
-    # attach loops_eff for context features (compute from raw using overrides)
-    overrides = {r["name"]: r for r in custom_loops_all(pid)}
-    for drow in days:
-        eff = {}
-        for name, raw in (drow.get("loops_raw") or {}).items():
-            amt, unit = raw.get("amount",0.0), raw.get("unit","minutes")
-            eff[name] = normalize_amount(name, amt, unit, overrides)
-        drow["loops_eff"] = eff
-
-    start = days[-1]["state"]
-    goal_text = settings_get(pid,"goal","")
-    M = learn_matrix(days)
-    M_calib, conf = calibrate_matrix(M, pid)
-    sims = adaptive_sims(M_calib)
-    probs, expF = simulate(M_calib, start, 30, sims)
-
-    df = pd.DataFrame({"day": range(1,31), "Focused": probs[:,0], "Mixed": probs[:,1], "Drift": probs[:,2]})
-    dfm = df.melt("day", var_name="state", value_name="p")
-
-    # Stats row: sparkline + metrics
-    last14 = days[-14:] if len(days) >= 1 else []
-    s_focus = [d.get("focus",0) for d in last14]
-    df_spark = pd.DataFrame({"idx": list(range(len(s_focus))), "focus": s_focus}) if s_focus else pd.DataFrame({"idx":[0], "focus":[0]})
-
-    c1,c2,c3,c4 = st.columns([2,1,1,1])
-    with c1:
-        st.caption("Last 14 days — Focus trend")
-        st.altair_chart(alt.Chart(df_spark).mark_line().encode(x="idx", y="focus").properties(height=60), use_container_width=True)
-    with c2:
-        st.metric("Expected focused days (30d)", f"{df['Focused'].sum():.1f}")
-    with c3:
-        st.metric("Current state", start)
-    with c4:
-        badge = f"<span class='badge {'good' if conf=='High' else 'mid' if conf=='Medium' else 'low'}'>Confidence: {conf}</span>"
-        st.markdown(badge, unsafe_allow_html=True)
-
-    # Area chart
-    st.altair_chart(
-        alt.Chart(dfm).mark_area(opacity=0.9).encode(
-            x="day:Q",
-            y=alt.Y("p:Q", stack="normalize", axis=alt.Axis(format="%")),
-            color=alt.Color("state:N", scale=alt.Scale(domain=["Focused","Mixed","Drift"], range=["#E0C36D","#888","#B91C1C"]))
-        ).properties(height=260),
-        use_container_width=True
-    )
-
-    # Scenario compare (canned)
-    with st.expander("Compare scenarios"):
-        baseF = float(df["Focused"].sum())
-        goal = settings_get(pid,"goal","")
-        POOL = interventions_pool(goal)
-        start_state = start
-
-        # context-aware top move
-        ctx_vec = current_context_vec(days, goal, start_state)
-        titles = [iv["title"] for iv in POOL]
-        scores = bandit_context_scores(pid, ctx_vec, titles)
-
-        def sim_delta(iv):
-            M2 = tweak_matrix(M_calib, **iv["tweak"])
-            probs2, _ = simulate(M2, start_state, 30, adaptive_sims(M2))
-            return float(probs2[:,0].sum() - baseF)
-
-        candidates = []
-        for iv in POOL:
-            delta = sim_delta(iv)
-            bscore = scores.get(iv["title"], 0.5)
-            blended = 0.7*delta + 0.3*(bscore-0.5)  # mild bandit bias
-            candidates.append({"iv":iv,"delta":delta,"bscore":bscore,"score":blended})
-        candidates.sort(key=lambda x: -x["score"])
-        best = candidates[0] if candidates else None
-
-        c1,c2 = st.columns(2)
-        with c1:
-            if best:
-                st.markdown("**Scenario A — Top move**")
-                st.markdown(f"**{best['iv']['title']}** → Δ Focused days ≈ **+{best['delta']:.2f}**")
-                st.caption(best['iv']['how'])
-        with c2:
-            # demonstrate another option
-            alt_iv = candidates[1] if len(candidates)>1 else None
-            st.markdown("**Scenario B — Next best**")
-            if alt_iv:
-                st.markdown(f"**{alt_iv['iv']['title']}** → Δ Focused days ≈ **+{alt_iv['delta']:.2f}**")
-                st.caption(alt_iv['iv']['how'])
-            else:
-                st.write("—")
-
-    # Forecast plausibility feedback
-    st.markdown("—")
-    st.markdown("**Did this forecast feel right?**")
-    c1,c2,c3 = st.columns(3)
-    with c1:
-        if st.button("Yes, plausible"):
-            run("INSERT INTO forecast_feedback(profile_id,at,accurate) VALUES(?,?,1)",
-                (pid, dt.datetime.now().isoformat()))
-            st.toast("Thanks — model calibrated slightly sharper.", icon="✅")
-    with c2:
-        if st.button("No, off today"):
-            run("INSERT INTO forecast_feedback(profile_id,at,accurate) VALUES(?,?,0)",
-                (pid, dt.datetime.now().isoformat()))
-            st.toast("Got it — model flattened a notch.", icon="⚠️")
-    with c3:
-        st.caption("Optional. Skipping is fine.")
-
-    # Rich brief (AI if on, else local) with dual-lens line
-    goal_text = settings_get(pid,"goal","")
-    # Simple goal likelihood proxy: assume plan target = 20 focused days
-    target = 20.0
-    lik_mid = np.clip((expF/target), 0.0, 1.25)
-    lik_lo, lik_hi = max(0.0, lik_mid - 0.15), min(1.0, lik_mid + 0.15)
-    avg_per_day = (sum([sum((d.get("loops_eff") or {}).values()) for d in days[-14:]]) / (14.0 if len(days)>=14 else max(1,len(days))))
-    # near-term milestones (illustrative)
-    milestones = ["3 focused days this week", "One zero-scroll day"]
-    unit_label = "mins"
-    # drivers (top pos/neg contributors)
-    drivers_pos = []
-    drivers_neg = []
-    if days_all:
-        last = days_all[-1]
-        micro = label_state(last.get("loops_eff") or {}, set(), set())[4] if last.get("loops_eff") else ""
-        # very light parse
-        drivers_pos = [seg.strip() for seg in micro.split("|")[0:1] if seg]
-        drivers_neg = [seg.strip() for seg in micro.split("|")[1:2] if seg]
-
-    # Dual lens context
-    active_primary = settings_get(pid,"lens_primary","Core") or "Core"
-    use_secondary = settings_get(pid,"lens_use_secondary","0") == "1"
-    active_secondary = settings_get(pid,"lens_secondary","Core") if use_secondary else None
-    blend = float(settings_get(pid,"lens_blend","0.0")) if active_secondary else 0.0
-
-    # Compose brief
-    ctx = {"goal": goal_text, "state": start}
-    lens_line = smart_lens_line(pid, "emergence", ctx, active_primary, active_secondary, blend)
-
-    # Build top-move again for brief (reuse best)
-    top_title = (best["iv"]["title"] if best else "")
-    top_delta = (best["delta"] if best else 0.0)
-
-    st.markdown("### Forecast brief")
-    brief_text = ""
-    if USE_AI and ai_available():
-        try:
-            brief_text = ai_narrate_forecast_rich(
-                goal=goal_text, start_state=start, focused_days=float(df['Focused'].sum()),
-                likelihood_mid=lik_mid, likelihood_band=(lik_lo, lik_hi),
-                required_pace_delta=max(0.0, (target - expF) / 30.0),
-                milestones=milestones,
-                top_move=top_title, top_move_delta=top_delta,
-                alt_upside="−30m scroll / +15m walk",
-                drivers_pos=drivers_pos, drivers_neg=drivers_neg
-            )
-        except Exception:
-            brief_text = ""
-
-    if not brief_text:
-        brief_text = local_narrate_forecast(
-            goal=goal_text, start_state=start, focused_days=float(df['Focused'].sum()),
-            likelihood_mid=lik_mid, likelihood_band=(lik_lo, lik_hi),
-            required_pace_delta=max(0.0, (target - expF) / 30.0), unit_label=unit_label,
-            milestones=milestones, drivers_pos=drivers_pos, drivers_neg=drivers_neg,
-            top_move_title=top_title, top_move_delta=top_delta
-        )
-
-    st.markdown(f"<div class='card'>{brief_text}<br><span class='small'>Lens: {lens_line}</span></div>", unsafe_allow_html=True)
-    st.caption(f"_Target pace: {target:.0f} {unit_label}; your 14-day avg: {avg_per_day:.1f} {unit_label}_")
-
-# =============
-# INTERVENTIONS TAB
-# =============
-elif tab == "Interventions":
-    st.header("Interventions")
-
-    days = load_days(pid, 120)
-    if not days:
-        st.info("Log at least 1 day.")
-        st.stop()
-
-    goal = settings_get(pid, "goal", "")
-    M = learn_matrix(days)
-    M_calib, _ = calibrate_matrix(M, pid)
-    start = days[-1]["state"]
-    base_probs, _ = simulate(M_calib, start, 30, adaptive_sims(M_calib))
-    baseF = float(base_probs[:,0].sum())
-
-    POOL = interventions_pool(goal)
-    ctx_vec = current_context_vec(days, goal, start)
-    titles = [iv["title"] for iv in POOL]
-    scores = bandit_context_scores(pid, ctx_vec, titles)
-
-    results = []
-    for iv in POOL:
-        M2 = tweak_matrix(M_calib, **iv["tweak"])
-        probs2, _ = simulate(M2, start, 30, adaptive_sims(M2))
-        delta = float(probs2[:,0].sum() - baseF)
-        bscore = scores.get(iv["title"], 0.5)
-        blended = 0.7*delta + 0.3*(bscore-0.5)
-        results.append({"iv":iv, "delta":delta, "bscore":bscore, "score":blended})
-    results.sort(key=lambda r: -r["score"])
-    top = results[0] if results else None
-
-    # Why chip from last state
-    micro = ""
-    if days_all:
-        last = days_all[-1]
-        if last.get("state"):
-            m_state, _, _, _, m_micro = label_state(last.get("loops_eff") or {}, set(), set())
-            micro = m_micro
-
-    if top:
-        st.markdown("### ⭐ Top move")
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown(f"**{top['iv']['title']}** — {top['iv']['how']}")
-        st.markdown(f"Δ Focused days ≈ **+{top['delta']:.2f}** &nbsp;•&nbsp; Bandit score: {top['bscore']:.2f}")
-        if micro:
-            st.caption(f"Why today: {micro}")
-        c1,c2,c3 = st.columns(3)
-        with c1:
-            if st.button(f"Apply: {top['iv']['title']}"):
-                log_intervention(pid, top['iv']['title'], accepted=True)
-                log_intervention_ctx(pid, top['iv']['title'], ctx_vec, helped=None)
-                st.success("Applied. Tell me later if it helped.")
-        with c2:
-            fb = st.selectbox("Did it help?", ["Skip","Yes","No"], key="fb_top")
-            if st.button("Save feedback"):
-                if fb!="Skip":
-                    helped = (fb=="Yes")
-                    log_intervention(pid, top['iv']['title'], accepted=True, helped=helped)
-                    log_intervention_ctx(pid, top['iv']['title'], ctx_vec, helped=helped)
-                    st.toast("Learned from your feedback.", icon="🧠")
-        with c3:
-            st.caption("Bandit update happens instantly on feedback.")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with st.expander("More options"):
-        for r in results[1:]:
-            st.markdown(f"**{r['iv']['title']}** — {r['iv']['how']}  \nΔ Focused days ≈ **+{r['delta']:.2f}** (bandit {r['bscore']:.2f})")
-            ca, cb, cc = st.columns([1,1,2])
-            with ca:
-                if st.button(f"Apply: {r['iv']['title']}", key=f"app_{r['iv']['title']}"):
-                    log_intervention(pid, r['iv']['title'], accepted=True)
-                    log_intervention_ctx(pid, r['iv']['title'], ctx_vec, helped=None)
-                    st.success("Applied.")
-            with cb:
-                fb = st.selectbox("Helped?", ["Skip","Yes","No"], key=f"fb_{r['iv']['title']}")
-                if st.button("Save", key=f"s_{r['iv']['title']}"):
-                    if fb!="Skip":
-                        helped = (fb=="Yes")
-                        log_intervention(pid, r['iv']['title'], accepted=True, helped=helped)
-                        log_intervention_ctx(pid, r['iv']['title'], ctx_vec, helped=helped)
-                        st.toast("Bandit updated.", icon="🧠")
-            with cc:
-                st.caption(" ")
-
-    st.markdown("---")
-    st.subheader("Proven for you")
-    dfp = pd.DataFrame(fetch("""
-      SELECT title,
-             ROUND(AVG(CASE WHEN helped IS NOT NULL THEN helped END)*100.0,1) AS success_pct,
-             SUM(CASE WHEN accepted=1 THEN 1 ELSE 0 END) AS trials
-      FROM interventions_log
-      WHERE profile_id=?
-      GROUP BY title
-      ORDER BY success_pct DESC NULLS LAST, trials DESC
-    """, (pid,)))
-    if dfp.empty:
-        st.caption("No data yet. Apply and rate a few moves to see your leaderboard.")
-    else:
-        st.dataframe(dfp, use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("Add your own intervention")
-    with st.form("add_iv"):
-        t = st.text_input("Title")
-        h = st.text_area("How to do it")
-        st.caption("Tweak (advanced): shift probabilities — small numbers are best.")
-        m_to_f = st.number_input("Mixed → Focused (e.g., +0.04)", value=0.0, step=0.01, format="%.2f")
-        d_self = st.number_input("Drift self (e.g., −0.03)", value=0.0, step=0.01, format="%.2f")
-        submitted = st.form_submit_button("Add")
-        if submitted and t.strip():
-            existing = interventions_pool(goal)  # not persisted; but we can show how to add at runtime
-            # For simplicity we store in session for now
-            st.session_state.setdefault("user_iv", [])
-            st.session_state["user_iv"].append({"title":t.strip(),"how":h.strip(),"tags":[],"tweak":{"m_to_f":m_to_f,"d_self":d_self}})
-            st.success("Added for this session (persistance of custom IVs can be added later).")
-
-# =============
-# DIAGNOSTICS TAB
-# =============
-elif tab == "Diagnostics":
-    st.header("Diagnostics")
-    st.caption("Force (+) = loops correlated with Focused days. Drift (−) = loops correlated with Drift days. Recency-weighted averages.")
-
-    days = load_days(pid, 180)
-    if not days:
-        st.info("No data yet.")
-        st.stop()
-
-    overrides = {r["name"]: r for r in custom_loops_all(pid)}
-    rows=[]
-    for d in days:
-        eff={}
-        for name, raw in (d.get("loops_raw") or {}).items():
-            eff[name] = normalize_amount(name, raw.get("amount",0.0), raw.get("unit","minutes"), overrides)
-        d["loops_eff"] = eff
-        for k,v in eff.items():
-            rows.append({"d": d["d"], "k": k, "minutes": v, "state": d["state"]})
-
-    if not rows:
-        st.info("No loops logged.")
-        st.stop()
-
-    df = pd.DataFrame(rows)
-    pivot = df.pivot_table(index="k", columns="state", values="minutes", aggfunc="mean").fillna(0.0)
-    # Pad missing columns
-    for s in ["Focused","Mixed","Drift"]:
-        if s not in pivot.columns:
-            pivot[s] = 0.0
-    pivot["lift"] = pivot["Focused"] - pivot["Drift"]
-
-    # 14→14 trend
-    dts = sorted({r["d"] for r in rows})
-    cut = len(dts)//2
-    first = set(dts[:cut]); last = set(dts[cut:])
-    df1 = df[df["d"].isin(first)]
-    df2 = df[df["d"].isin(last)]
-    p1 = df1.pivot_table(index="k", columns="state", values="minutes", aggfunc="mean").fillna(0.0)
-    p2 = df2.pivot_table(index="k", columns="state", values="minutes", aggfunc="mean").fillna(0.0)
-    for s in ["Focused","Mixed","Drift"]:
-        for p in (p1,p2):
-            if s not in p.columns: p[s]=0.0
-    p1["lift"]=p1["Focused"]-p1["Drift"]; p2["lift"]=p2["Focused"]-p2["Drift"]
-    trend = (p2["lift"] - p1["lift"]).fillna(0.0)
-
-    best = pivot.sort_values("lift", ascending=False).head(5).copy()
-    worst= pivot.sort_values("lift", ascending=True).head(5).copy()
-    best["Δ(14→14)"]  = trend.reindex(best.index).fillna(0.0)
-    worst["Δ(14→14)"] = trend.reindex(worst.index).fillna(0.0)
-
-    c1,c2 = st.columns(2)
-    with c1:
-        st.subheader("Force (+)")
-        st.dataframe(best[["lift","Focused","Drift","Δ(14→14)"]])
-    with c2:
-        st.subheader("Drift (−)")
-        st.dataframe(worst[["lift","Focused","Drift","Δ(14→14)"]])
-
-# =============
-# LENS TAB
-# =============
-elif tab == "Lens":
-    st.header("Lenses")
-    st.caption("Upload text to create a lens. Valid keys: collapse, recursion, emergence, neutral → arrays of short lines.")
-
-    # Add / upload
-    up = st.file_uploader("Upload .txt / .docx / .pdf (optional)", type=["txt","docx","pdf"])
-    lens_name = st.text_input("Lens name", value="My Lens")
-    if st.button("Add lens"):
-        text = ""
-        try:
-            if up:
-                if up.name.lower().endswith(".txt"):
-                    text = up.read().decode("utf-8","ignore")
-                elif up.name.lower().endswith(".docx") and docx:
-                    d = docx.Document(up); text = "\n".join(p.text for p in d.paragraphs)
-                elif up.name.lower().endswith(".pdf") and PyPDF2:
-                    pdf = PyPDF2.PdfReader(up)
-                    text = "\n".join((page.extract_text() or "") for page in pdf.pages)
-        except Exception:
-            text = ""
-
-        # Simple heuristics → lens buckets
-        buckets = {"collapse":[],"recursion":[],"emergence":[],"neutral":[]}
-        if text.strip():
-            lines = [l.strip() for l in text.replace("\r","").split("\n") if len(l.strip())>8]
-            for ln in lines:
-                low = ln.lower()
-                if any(k in low for k in ["release","end","quit","close","let go"]): buckets["collapse"].append(ln)
-                elif any(k in low for k in ["repeat","again","habit","loop","daily","consistency"]): buckets["recursion"].append(ln)
-                elif any(k in low for k in ["begin","start","spark","future","transform","new"]): buckets["emergence"].append(ln)
-                else:
-                    buckets["neutral"].append(ln)
-        else:
-            # empty lens is fine — uses core phrases
-            pass
-
-        valid = strict_lens_schema(buckets)
-        if valid:
-            lens_put(pid, lens_name, valid)
-            st.success("Lens saved.")
-        else:
-            st.error("Invalid lens data.")
-
-    st.markdown("---")
-    # Active lenses
-    all_lenses_dict = get_all_lenses_dict(pid)
-    LENS_NAMES = list(all_lenses_dict.keys())
-
-    colA,colB,colC = st.columns([1,1,2])
-    with colA:
-        sel1 = st.selectbox("Primary lens", LENS_NAMES, index=LENS_NAMES.index(settings_get(pid,"lens_primary","Core")) if settings_get(pid,"lens_primary","Core") in LENS_NAMES else 0)
-        settings_set(pid,"lens_primary",sel1)
-    with colB:
-        use2 = st.checkbox("Use secondary lens", value=(settings_get(pid,"lens_use_secondary","0")=="1"))
-        settings_set(pid,"lens_use_secondary","1" if use2 else "0")
-        if use2:
-            sel2 = st.selectbox("Secondary lens", LENS_NAMES, index=LENS_NAMES.index(settings_get(pid,"lens_secondary","Core")) if settings_get(pid,"lens_secondary","Core") in LENS_NAMES else 0)
-            settings_set(pid,"lens_secondary",sel2)
-    with colC:
-        blend = st.slider("Blend weight (secondary influence)", 0.0, 1.0, float(settings_get(pid,"lens_blend","0.0")) if use2 else 0.0, 0.05, disabled=not use2)
-        settings_set(pid,"lens_blend",blend)
-
-    # Preview
-    ctx = {"goal": settings_get(pid,"goal","")}
-    prev = smart_lens_line(pid, "recursion", ctx, sel1, (sel2 if use2 else None), blend)
-    st.markdown(f"**Preview line:** {prev or '—'}")
-
-# =============
-# LENS MEMORY TAB
-# =============
-elif tab == "Lens Memory":
-    st.header("Lens Memory")
-    rec = lens_memory_recent(pid, 50)
-    if not rec:
-        st.caption("No lines yet. Use Forecast or Interventions to see narration appear here.")
-    else:
-        for r in rec:
-            st.markdown(f"`{r['at']}` • **{r['lens_name']}** / *{r['kind']}*  \n> {r['phrase']}")
-
-# =============
-# EXPORT / IMPORT TAB
-# =============
-elif tab == "Export/Import":
-    st.header("Export / Import (profile-scoped)")
-    if st.button("Export"):
-        dump = {
-            "profile": sel,
-            "settings": fetch("SELECT key,val FROM settings WHERE profile_id=?", (pid,)),
-            "days": fetch("SELECT * FROM days WHERE profile_id=?", (pid,)),
-            "loops": fetch("SELECT * FROM loops WHERE profile_id=?", (pid,)),
-            "custom_loops": fetch("SELECT * FROM custom_loops WHERE profile_id=?", (pid,)),
-            "lens": fetch("SELECT name,data FROM lens WHERE profile_id=?", (pid,)),
-            "lens_memory": fetch("SELECT at,lens_name,kind,phrase,ctx FROM lens_memory WHERE profile_id=?", (pid,)),
-            "interventions_log": fetch("SELECT at,title,accepted,helped FROM interventions_log WHERE profile_id=?", (pid,)),
-            "interventions_log_ctx": fetch("SELECT at,title,ctx,reward FROM interventions_log_ctx WHERE profile_id=?", (pid,)),
-            "forecast_feedback": fetch("SELECT at,accurate FROM forecast_feedback WHERE profile_id=?", (pid,))
-        }
-        st.download_button("Download JSON", data=json.dumps(dump, indent=2).encode("utf-8"), file_name=f"timesculpt_{sel}.json", mime="application/json")
-
-    st.markdown("---")
-    up = st.file_uploader("Import JSON (replaces conflicting rows)", type=["json"])
-    if up and st.button("Import now"):
-        try:
-            data = json.loads(up.read().decode("utf-8"))
-            # minimal safety
-            for row in data.get("settings", []):
-                settings_set(pid, row["key"], row["val"])
-            for row in data.get("days", []):
-                run("INSERT OR REPLACE INTO days(profile_id,d,note,state,focus,energy,progress) VALUES(?,?,?,?,?,?,?)",
-                    (pid,row["d"],row["note"],row["state"],row["focus"],row["energy"],row["progress"]))
-            for row in data.get("loops", []):
-                run("INSERT OR REPLACE INTO loops(profile_id,d,name,amount,unit) VALUES(?,?,?,?,?)",
-                    (pid,row["d"],row["name"],row["amount"],row.get("unit","minutes")))
-            for row in data.get("custom_loops", []):
-                custom_loop_add(pid,row["name"],row["category"],row["polarity"],row.get("unit","minutes"),row.get("rate_label","weight"),row.get("rate_value",1.0))
-            for row in data.get("lens", []):
-                d = strict_lens_schema(json.loads(row["data"])) if isinstance(row["data"], (str,bytes)) else strict_lens_schema(row["data"])
-                if d: lens_put(pid,row["name"],d)
-            for row in data.get("lens_memory", []):
-                log_lens_memory(pid,row["lens_name"],row["kind"],row["phrase"],json.loads(row.get("ctx","{}")))
-            for row in data.get("interventions_log", []):
-                run("INSERT INTO interventions_log(profile_id,at,title,accepted,helped) VALUES(?,?,?,?,?)",
-                    (pid,row["at"],row["title"],row.get("accepted",0),row.get("helped",None)))
-            for row in data.get("interventions_log_ctx", []):
-                run("INSERT INTO interventions_log_ctx(profile_id,at,title,ctx,reward) VALUES(?,?,?, ?,?)",
-                    (pid,row["at"],row["title"],json.dumps(row.get("ctx",[])),row.get("reward",None)))
-            for row in data.get("forecast_feedback", []):
-                run("INSERT INTO forecast_feedback(profile_id,at,accurate) VALUES(?,?,?)",
-                    (pid,row["at"],row.get("accurate",1)))
-            st.success("Import complete.")
-        except Exception as e:
-            st.error(f"Import failed: {e}")
-
-# =============
-# HELP TAB (last)
-# =============
-elif tab == "Help":
-    st.header("How to use TimeSculpt")
-    st.markdown("""
-1) **Input** → Log your day with units that make sense to you.  
-   - The system converts everything to **effective minutes** for scoring.
-   - Add your **Goal**; suggestions and narration bias toward it.
-   - Use **Undo last commit** if you mis-logged.
-
-2) **Forecast** → See the next 30 days as probabilities (Focused / Mixed / Drift).  
-   - The model **learns transitions** from your history (Dirichlet calibration).  
-   - Mark "plausible/off" to help it calibrate.  
-   - Read the **Brief** for one clear takeaway (AI optional).
-
-3) **Interventions** → Smallest honest moves ranked by expected impact.  
-   - **Apply** a move; later mark **Helped?** → the **bandit** learns which moves work for *you*.  
-   - See **Proven for you** over 30/90 days.
-
-4) **Diagnostics** → Find your **Force (+)** and **Drift (−)** loops, plus 14→14 changes.
-
-5) **Lens** → Upload passages to shape the app’s voice.  
-   - You can blend a secondary lens; the system avoids recent repeats and favors lines aligned to your goal.
-
-6) **Lens Memory** → Every line the app spoke, saved.
-
-7) **Export/Import** → Your data, per profile, portable.
-
-**Privacy:** All data is local (SQLite). AI calls happen only if you toggle **AI narration** on and you have `OPENAI_API_KEY` set in your environment.
-""")
+# ============================================================ 
+
+# TimeSculpt — Monolithic Build (Field Engine Mesh, Goal-Centric) 
+
+# ============================================================ 
+
+# This single-file app includes: 
+
+# - Profiles (multi-user) with PIN hashing + optional AI API key (stored per user) 
+
+# - Field Engine Mesh (field_state) so all tabs publish/subscribe shared signals 
+
+# - Loops Input (built-ins + custom loops; units normalized; dynamic preview) 
+
+# - Goal-Centric Forecast: 
+
+#     * Beta-Binomial progress model → success probability in 30 days 
+
+#     * Simple survival-style ETA ribbon (50% / 80%) from momentum expectation 
+
+#     * Classical 3-state baseline (Momentum / Mixed / Stuck) is computed silently 
+
+# - Interventions: 
+
+#     * Contextual bandit (Linear Thompson Sampling) learns what works for YOU 
+
+#     * Actionable cards (Apply / Helped? Yes/No) 
+
+#     * “Proven for you” leaderboard 
+
+#     * Bandit scores influence forecast comparison (“do nothing” vs “apply top move”) 
+
+# - Diagnostics: 
+
+#     * Force (+) vs Drag (−) correlations, padded to avoid missing columns errors 
+
+#     * “Why today” micro-explanation chip 
+
+# - Lenses: 
+
+#     * Upload .txt/.docx/.pdf → passages auto-categorized (collapse/recursion/emergence/neutral) 
+
+#     * Multi-lens support (primary + secondary) + lens memory (avoid repeats, goal bias) 
+
+#     * Smart narration line (no over-explaining why it chose it) 
+
+# - Future Self: 
+
+#     * Define Title + Traits + Rituals (saved) 
+
+#     * SMART Challenges: progress, due date, status, redo option 
+
+#     * Letters to Past Self with scheduled resurfacing (also inline nudges when confidence low) 
+
+# - AI Toggle: 
+
+#     * OFF → entirely local narration 
+
+#     * ON → optional AI narration if API key present (fails safely if not) 
+
+# - Visual polish: 
+
+#     * Sticky header context, 14-day sparkline, metrics, framed cards 
+
+#     * Light, readable labels on non-dark theme 
+
+# - Safe & robust: 
+
+#     * PIN stored hashed, AI exceptions hidden, lens JSON schema guard 
+
+#     * No silent DB errors (printed), missing columns padded, input validation 
+
+# ============================================================ 
+
+ 
+
+import os, json, math, random, hashlib, datetime as dt 
+
+from typing import List, Dict, Any, Tuple 
+
+import sqlite3 
+
+ 
+
+import numpy as np 
+
+import pandas as pd 
+
+import streamlit as st 
+
+import altair as alt 
+
+ 
+
+# Optional imports for lens parsing 
+
+try: 
+
+    import docx 
+
+except Exception: 
+
+    docx = None 
+
+try: 
+
+    import PyPDF2 
+
+except Exception: 
+
+    PyPDF2 = None 
+
+ 
+
+# Optional AI (OpenAI). App runs fine without it. 
+
+try: 
+
+    import openai 
+
+except Exception: 
+
+    openai = None 
+
+ 
+
+# ------------------------ UI CONFIG ------------------------- 
+
+st.set_page_config(page_title="TimeSculpt", layout="wide") 
+
+st.markdown(""" 
+
+<style> 
+
+/* Make labels and inputs readable on light themes */ 
+
+label, .stTextInput label, .stNumberInput label, .stSelectbox label, .stDateInput label, .stTextArea label { 
+
+  color:#222 !important; font-weight:600; 
+
+} 
+
+div[data-baseweb="input"] input, textarea, .stTextArea textarea { 
+
+  color:#111 !important; background:#FAFAFA !important; 
+
+} 
+
+.stCaption, .st-emotion-cache-1xarl3l, .st-emotion-cache-16idsys p, .st-emotion-cache-10trblm p { 
+
+  color:#444 !important; 
+
+} 
+
+.card { border:1px solid #e5e7eb; border-radius:10px; padding:12px; background:#fff; } 
+
+.stat { border:1px solid #ddd; border-radius:12px; padding:10px; text-align:center; background:#fff; } 
+
+.small { font-size:12px; color:#666; } 
+
+.badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#f1f5f9; color:#111; font-size:11px; border:1px solid #e5e7eb; } 
+
+.btnrow { display:flex; gap:8px; align-items:center; flex-wrap:wrap; } 
+
+</style> 
+
+""", unsafe_allow_html=True) 
+
+ 
+
+# ------------------------ DB CORE --------------------------- 
+
+DB = "timesculpt.db" 
+
+ 
+
+def _conn(): 
+
+    c = sqlite3.connect(DB, check_same_thread=False) 
+
+    c.row_factory = sqlite3.Row 
+
+    return c 
+
+ 
+
+def run(q, p=()): 
+
+    con = _conn() 
+
+    try: 
+
+        con.execute(q, p) 
+
+        con.commit() 
+
+    except Exception as e: 
+
+        print("DB error:", e, "\nSQL:", q) 
+
+    finally: 
+
+        con.close() 
+
+ 
+
+def fetch(q, p=()): 
+
+    con = _conn() 
+
+    try: 
+
+        cur = con.execute(q, p) 
+
+        rows = cur.fetchall() 
+
+        return [dict(r) for r in rows] 
+
+    except Exception as e: 
+
+        print("DB error:", e, "\nSQL:", q) 
+
+        return [] 
+
+    finally: 
+
+        con.close() 
+
+ 
+
+def init_db(): 
+
+    run("""CREATE TABLE IF NOT EXISTS profiles( 
+
+        id TEXT PRIMARY KEY, 
+
+        name TEXT, 
+
+        pin_hash TEXT, 
+
+        api_key TEXT 
+
+    )""") 
+
+    run("""CREATE TABLE IF NOT EXISTS days( 
+
+        user_id TEXT, 
+
+        d TEXT, 
+
+        loops TEXT,           -- JSON of raw inputs by user units (minutes/pages/etc) 
+
+        eff_loops TEXT,       -- JSON of normalized "effective minutes" 
+
+        note TEXT, 
+
+        focus REAL, 
+
+        energy REAL, 
+
+        progress REAL, 
+
+        state TEXT            -- internal (Momentum/Mixed/Stuck) NOT shown to user 
+
+    )""") 
+
+    run("""CREATE TABLE IF NOT EXISTS custom_loops( 
+
+        user_id TEXT, 
+
+        name TEXT, 
+
+        category TEXT,        -- creation/mind/body/consumption/food/finance/other 
+
+        polarity INTEGER,     -- +1 helpful, -1 harmful 
+
+        unit TEXT,            -- minutes/hours/pages/chapters/reps/£/% 
+
+        rate REAL             -- unit→effective minutes multiplier (auto from unit) 
+
+    )""") 
+
+    run("""CREATE TABLE IF NOT EXISTS interventions_log( 
+
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+
+        user_id TEXT, 
+
+        at TEXT, 
+
+        title TEXT, 
+
+        accepted INT, 
+
+        helped INT 
+
+    )""") 
+
+    run("""CREATE TABLE IF NOT EXISTS interventions_log_ctx( 
+
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+
+        user_id TEXT, 
+
+        at TEXT, 
+
+        title TEXT, 
+
+        ctx TEXT,             -- JSON list of floats (context vector) 
+
+        reward REAL           -- 1.0 helped, 0.0 not helped 
+
+    )""") 
+
+    run("""CREATE TABLE IF NOT EXISTS lenses( 
+
+        user_id TEXT, 
+
+        name TEXT, 
+
+        data TEXT             -- JSON: {collapse:[], recursion:[], emergence:[], neutral:[]} 
+
+    )""") 
+
+    run("""CREATE TABLE IF NOT EXISTS lens_memory( 
+
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+
+        user_id TEXT, 
+
+        at TEXT, 
+
+        lens TEXT, 
+
+        kind TEXT,            -- collapse/recursion/emergence/neutral 
+
+        phrase TEXT, 
+
+        ctx TEXT              -- JSON context e.g. {"goal": "...", "state": "..."} 
+
+    )""") 
+
+    run("""CREATE TABLE IF NOT EXISTS future_self( 
+
+        user_id TEXT, 
+
+        title TEXT, 
+
+        traits TEXT,          -- comma sep 
+
+        rituals TEXT          -- comma sep 
+
+    )""") 
+
+    run("""CREATE TABLE IF NOT EXISTS future_challenges( 
+
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+
+        user_id TEXT, 
+
+        title TEXT, 
+
+        why TEXT, 
+
+        smart TEXT, 
+
+        due_on TEXT, 
+
+        progress REAL, 
+
+        status TEXT           -- active/completed/dropped 
+
+    )""") 
+
+    run("""CREATE TABLE IF NOT EXISTS future_letters( 
+
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+
+        user_id TEXT, 
+
+        content TEXT, 
+
+        created_at TEXT, 
+
+        reveal_on TEXT, 
+
+        revealed INT 
+
+    )""") 
+
+    run("""CREATE TABLE IF NOT EXISTS field_state( 
+
+        user_id TEXT, 
+
+        key TEXT, 
+
+        value TEXT, 
+
+        updated_at TEXT, 
+
+        PRIMARY KEY(user_id,key) 
+
+    )""") 
+
+    run("""CREATE TABLE IF NOT EXISTS goals( 
+
+        user_id TEXT, 
+
+        objective TEXT,       -- Goal name/description 
+
+        unit TEXT,            -- unit to track pace (minutes/pages/£/reps/etc) 
+
+        target REAL,          -- target total (e.g., 50000 words, or 200 pages, or £3000) 
+
+        horizon_days INTEGER, -- horizon for forecast window (default 30) 
+
+        active INT            -- 1 active, 0 inactive 
+
+    )""") 
+
+ 
+
+init_db() 
+
+ 
+
+# ---------------------- FIELD ENGINE ------------------------ 
+
+def field_set(uid: str, key: str, value: dict): 
+
+    run("""INSERT OR REPLACE INTO field_state(user_id,key,value,updated_at) 
+
+           VALUES(?,?,?,?)""", 
+
+        (uid, key, json.dumps(value), dt.datetime.now().isoformat())) 
+
+ 
+
+def field_get(uid: str, key: str, default=None): 
+
+    rows = fetch("SELECT value FROM field_state WHERE user_id=? AND key=?", (uid, key)) 
+
+    if rows: 
+
+        try: 
+
+            return json.loads(rows[0]["value"]) 
+
+        except Exception: 
+
+            return default 
+
+    return default 
+
+ 
+
+# ---------------------- AUTH / PROFILE ---------------------- 
+
+def hash_pin(pin: str) -> str: 
+
+    return hashlib.sha256((pin or "").encode()).hexdigest() 
+
+ 
+
+def create_profile(name: str, pin: str) -> str: 
+
+    uid = hashlib.sha1((name+"|"+pin+str(dt.datetime.now())).encode()).hexdigest()[:12] 
+
+    run("INSERT INTO profiles(id,name,pin_hash,api_key) VALUES(?,?,?,?)", 
+
+        (uid, name, hash_pin(pin), "")) 
+
+    return uid 
+
+ 
+
+def auth_profile(name: str, pin: str): 
+
+    rows = fetch("SELECT * FROM profiles WHERE name=?", (name,)) 
+
+    if rows and rows[0]["pin_hash"] == hash_pin(pin): 
+
+        return rows[0] 
+
+    return None 
+
+ 
+
+def get_profile(uid: str): 
+
+    rows = fetch("SELECT * FROM profiles WHERE id=?", (uid,)) 
+
+    return rows[0] if rows else None 
+
+ 
+
+# ---------------------- SETTINGS / GOAL --------------------- 
+
+def get_active_goal(uid: str): 
+
+    rows = fetch("SELECT * FROM goals WHERE user_id=? AND active=1", (uid,)) 
+
+    return rows[0] if rows else None 
+
+ 
+
+def set_goal(uid: str, objective: str, unit: str, target: float, horizon: int = 30): 
+
+    run("UPDATE goals SET active=0 WHERE user_id=?", (uid,)) 
+
+    run("""INSERT INTO goals(user_id,objective,unit,target,horizon_days,active) 
+
+           VALUES(?,?,?,?,?,1)""", (uid, objective, unit, float(target), int(horizon))) 
+
+ 
+
+# ---------------------- LENS SYSTEM ------------------------- 
+
+CORE_LENS = { 
+
+    "name": "Core", 
+
+    "collapse": [ 
+
+        "Release what drags you sideways.", 
+
+        "Close one loop before you open another.", 
+
+        "You can’t carry every door at once." 
+
+    ], 
+
+    "recursion": [ 
+
+        "Small loops compound into identity.", 
+
+        "Repeat the action that proves the future.", 
+
+        "Begin poorly. Arrival happens mid-motion." 
+
+    ], 
+
+    "emergence": [ 
+
+        "Invite the first true move.", 
+
+        "Seeds break in quiet; new timelines start small.", 
+
+        "Act once; momentum will meet you." 
+
+    ], 
+
+    "neutral": [ 
+
+        "Attend to what is here. Choose again.", 
+
+        "Write what happened. Name what matters.", 
+
+        "Breathe, look, act." 
+
+    ] 
+
+} 
+
+ 
+
+LENS_KEYS = {"collapse","recursion","emergence","neutral"} 
+
+ 
+
+def lens_schema_guard(obj: dict) -> dict: 
+
+    out = {k: [] for k in LENS_KEYS} 
+
+    if not isinstance(obj, dict): 
+
+        return out 
+
+    for k in LENS_KEYS: 
+
+        vals = obj.get(k, []) 
+
+        if isinstance(vals, list): 
+
+            out[k] = [str(x).strip() for x in vals if isinstance(x, (str, int, float)) and str(x).strip()] 
+
+    return out 
+
+ 
+
+def parse_lens_file(upload) -> dict: 
+
+    text = "" 
+
+    name = upload.name 
+
+    try: 
+
+        if name.lower().endswith(".txt"): 
+
+            text = upload.read().decode("utf-8", "ignore") 
+
+        elif name.lower().endswith(".docx") and docx: 
+
+            d = docx.Document(upload) 
+
+            text = "\n".join(p.text for p in d.paragraphs) 
+
+        elif name.lower().endswith(".pdf") and PyPDF2: 
+
+            pdf = PyPDF2.PdfReader(upload) 
+
+            text = "\n".join((page.extract_text() or "") for page in pdf.pages) 
+
+    except Exception: 
+
+        text = "" 
+
+    text = (text or "").replace("\r","") 
+
+    chunks = [p.strip() for p in text.split("\n") if len(p.strip()) >= 40] or [text[:280]] 
+
+    parts = {"collapse":[],"recursion":[],"emergence":[],"neutral":[]} 
+
+    KW = { 
+
+        "collapse": ["release","close","end","quit","discard","stop","let go"], 
+
+        "recursion": ["repeat","again","habit","loop","daily","consistency"], 
+
+        "emergence": ["begin","start","spark","new","future","grow","transform"] 
+
+    } 
+
+    for p in chunks: 
+
+        t = p.lower() 
+
+        cat = "neutral" 
+
+        for k, keys in KW.items(): 
+
+            if any(w in t for w in keys): 
+
+                cat = k; break 
+
+        parts[cat].append(p[:400]) 
+
+    return lens_schema_guard(parts) 
+
+ 
+
+def lenses_for_user(uid: str) -> Dict[str, dict]: 
+
+    rows = fetch("SELECT * FROM lenses WHERE user_id=?", (uid,)) 
+
+    out = {"Core": CORE_LENS} 
+
+    for r in rows: 
+
+        try: 
+
+            data = json.loads(r["data"]) 
+
+            out[r["name"]] = {"name": r["name"], **lens_schema_guard(data)} 
+
+        except Exception: 
+
+            pass 
+
+    return out 
+
+ 
+
+def lens_memory_log(uid: str, lens_name: str, kind: str, phrase: str, ctx: dict): 
+
+    run("""INSERT INTO lens_memory(user_id,at,lens,kind,phrase,ctx) 
+
+           VALUES(?,?,?,?,?,?)""", 
+
+        (uid, dt.datetime.now().isoformat(), lens_name, kind, phrase, json.dumps(ctx))) 
+
+ 
+
+def smart_lens_line(uid: str, kind: str, ctx: dict, primary: str, secondary: str=None) -> str: 
+
+    all_l = lenses_for_user(uid) 
+
+    pools = [] 
+
+    if primary in all_l: pools.append(all_l[primary].get(kind, [])) 
+
+    if secondary and secondary in all_l: pools.append(all_l[secondary].get(kind, [])) 
+
+    pools.append(CORE_LENS.get(kind, [])) 
+
+    pool = [x for arr in pools for x in (arr or [])] 
+
+ 
+
+    if not pool: 
+
+        return "" 
+
+ 
+
+    recent = fetch("""SELECT phrase FROM lens_memory 
+
+                      WHERE user_id=? AND kind=? 
+
+                      ORDER BY id DESC LIMIT 15""", (uid, kind)) 
+
+    recent_set = {r["phrase"] for r in recent} 
+
+    candidates = [p for p in pool if p not in recent_set] or pool 
+
+ 
+
+    # goal bias 
+
+    goal = (ctx.get("goal") or "").lower() 
+
+    if goal: 
+
+        weighted = [] 
+
+        kws = [w for w in goal.split() if len(w) > 3] 
+
+        for p in candidates: 
+
+            score = 1 
+
+            tl = p.lower() 
+
+            if any(w in tl for w in kws): score += 2 
+
+            weighted += [p]*score 
+
+        candidates = weighted 
+
+ 
+
+    phrase = random.choice(candidates) 
+
+    lens_memory_log(uid, primary or "Core", kind, phrase, ctx) 
+
+    return phrase 
+
+ 
+
+# -------------------- UNIT NORMALIZATION -------------------- 
+
+# Built-in loops with default units and polarity (+ helpful / - harmful) 
+
+BUILTIN = [ 
+
+    ("creation:writing", +1, "minutes"), 
+
+    ("creation:project", +1, "minutes"), 
+
+    ("mind:reading", +1, "pages"), 
+
+    ("mind:planning", +1, "minutes"), 
+
+    ("mind:meditation", +1, "minutes"), 
+
+    ("body:walk", +1, "minutes"), 
+
+    ("body:exercise", +1, "minutes"), 
+
+    ("body:sleep_good", +1, "hours"), 
+
+    ("body:late_sleep", -1, "minutes"), 
+
+    ("consumption:scroll", -1, "minutes"), 
+
+    ("consumption:youtube", -1, "minutes"), 
+
+    ("food:junk", -1, "servings"), 
+
+    ("finance:save_invest", +1, "£"), 
+
+    ("finance:budget_check", +1, "minutes"), 
+
+    ("finance:impulse_spend", -1, "£") 
+
+] 
+
+ 
+
+# Unit → effective minutes default multipliers 
+
+UNIT_DEFAULT_RATE = { 
+
+    "minutes": 1.0, 
+
+    "hours": 60.0, 
+
+    "pages": 1.0,         # assume 1 page ≈ 1 minute by default, user can calibrate 
+
+    "chapters": 20.0,     # assume 1 chapter ≈ 20 minutes 
+
+    "reps": 0.25,         # rough neutralization 
+
+    "£": 0.05,            # £20 ≈ +1 effective minute (conservative); calibrate per user 
+
+    "%": 1.0,             # % of income → special handling if needed 
+
+    "servings": 10.0      # one junk serving = 10 "negative minutes" 
+
+} 
+
+ 
+
+def get_loop_catalog(uid: str) -> List[dict]: 
+
+    cat = [] 
+
+    for name, pol, unit in BUILTIN: 
+
+        cat.append({"name": name, "category": name.split(":")[0], "polarity": pol, "unit": unit, "rate": UNIT_DEFAULT_RATE.get(unit, 1.0), "builtin": True}) 
+
+    customs = fetch("SELECT * FROM custom_loops WHERE user_id=?", (uid,)) 
+
+    for r in customs: 
+
+        rate = r["rate"] 
+
+        if rate is None or rate <= 0: 
+
+            rate = UNIT_DEFAULT_RATE.get(r["unit"], 1.0) 
+
+        cat.append({"name": f"{r['category']}:{r['name']}", "category": r["category"], "polarity": r["polarity"], "unit": r["unit"], "rate": rate, "builtin": False}) 
+
+    return cat 
+
+ 
+
+def normalize_amount(unit: str, raw_val: float, rate: float) -> float: 
+
+    if raw_val <= 0: return 0.0 
+
+    # basic sanity clamps 
+
+    raw_val = float(raw_val) 
+
+    if unit == "hours": raw_val = min(raw_val, 24) 
+
+    if unit == "minutes": raw_val = min(raw_val, 24*60) 
+
+    if unit == "pages": raw_val = min(raw_val, 1000) 
+
+    if unit == "chapters": raw_val = min(raw_val, 50) 
+
+    if unit == "£": raw_val = min(raw_val, 1000000) 
+
+    if unit == "reps": raw_val = min(raw_val, 2000) 
+
+    if unit == "servings": raw_val = min(raw_val, 12) 
+
+ 
+
+    # convert to effective minutes: 
+
+    return float(raw_val * (rate if rate else UNIT_DEFAULT_RATE.get(unit, 1.0))) 
+
+ 
+
+# ---------------------- STATE LABELING ---------------------- 
+
+W_POS, W_NEG, W_PROG, W_ENER = 0.8, 0.9, 0.25, 0.15 
+
+STATES = ["Momentum","Mixed","Stuck"] 
+
+IDX = {s:i for i,s in enumerate(STATES)} 
+
+ 
+
+def label_state(eff_loops: Dict[str,float], pos_names: set, neg_names: set) -> Tuple[str,float,float,float,str]: 
+
+    posm = sum(eff_loops.get(k,0) for k in pos_names) 
+
+    negm = sum(eff_loops.get(k,0) for k in neg_names) 
+
+    energy = min(100.0, (eff_loops.get("body:walk",0)*1.2 + eff_loops.get("body:exercise",0)*1.6 + eff_loops.get("body:sleep_good",0)*0.5) / 2.0) 
+
+    progress = min(100.0, (eff_loops.get("creation:writing",0)*1.4 + eff_loops.get("creation:project",0)*1.2 + eff_loops.get("finance:save_invest",0)*0.5 + eff_loops.get("mind:planning",0)*0.9) / 2.0) 
+
+    focus = max(0.0, min(100.0, (posm*W_POS - negm*W_NEG) + progress*W_PROG + energy*W_ENER)) 
+
+    if negm > posm*1.2 or eff_loops.get("consumption:scroll",0) >= 45: state = "Stuck" 
+
+    elif posm >= negm and (eff_loops.get("creation:writing",0)+eff_loops.get("creation:project",0)) >= 30: 
+
+        state = "Momentum" 
+
+    else: 
+
+        state = "Mixed" 
+
+    # micro explanation 
+
+    contribs=[] 
+
+    for k in pos_names: 
+
+        m=eff_loops.get(k,0);  
+
+        if m>0: contribs.append((k, +m*W_POS, m)) 
+
+    for k in neg_names: 
+
+        m=eff_loops.get(k,0);  
+
+        if m>0: contribs.append((k, -m*W_NEG, m)) 
+
+    pos_sorted = sorted([c for c in contribs if c[1]>0], key=lambda x:-x[1])[:2] 
+
+    neg_sorted = sorted([c for c in contribs if c[1]<0], key=lambda x:abs(x[1]), reverse=True)[:2] 
+
+    def fmt_pos(c): return f"+{int(c[2])}m {c[0].split(':',1)[1]} (impact +{c[1]:.1f})" 
+
+    def fmt_neg(c): return f"-{int(c[2])}m {c[0].split(':',1)[1]} (impact {c[1]:.1f})" 
+
+    plus = ", ".join(fmt_pos(c) for c in pos_sorted) if pos_sorted else "+0m" 
+
+    minus = ", ".join(fmt_neg(c) for c in neg_sorted) if neg_sorted else "-0m" 
+
+    micro = f"{plus} | {minus}" 
+
+    return state, round(focus,1), round(energy,1), round(progress,1), micro 
+
+ 
+
+# ------------- TRANSITION MATRIX (CLASSICAL BASELINE) ------- 
+
+DECAY = 0.97 
+
+PRIOR_WEIGHT = 0.5 
+
+UNIFORM_BLEND = 0.08 
+
+ 
+
+def learn_matrix(days_rows: List[dict], decay=DECAY) -> np.ndarray: 
+
+    C = np.ones((3,3))*PRIOR_WEIGHT 
+
+    last = None 
+
+    w = 1.0 
+
+    for d in days_rows: 
+
+        s = d.get("state") 
+
+        if s not in IDX: continue 
+
+        if last is not None: 
+
+            C[IDX[last], IDX[s]] += w 
+
+        w *= decay; last = s 
+
+    M = C / C.sum(axis=1, keepdims=True) 
+
+    U = np.ones((3,3))/3.0 
+
+    M = (1-UNIFORM_BLEND)*M + UNIFORM_BLEND*U 
+
+    return M / M.sum(axis=1, keepdims=True) 
+
+ 
+
+def simulate(M: np.ndarray, start_state: str, days=30, sims=1500) -> Tuple[np.ndarray, float]: 
+
+    start = IDX.get(start_state, 1) 
+
+    counts = np.zeros((days, 3)) 
+
+    for _ in range(sims): 
+
+        s = start 
+
+        for t in range(days): 
+
+            counts[t, s] += 1 
+
+            s = np.random.choice([0,1,2], p=M[s]) 
+
+    probs = counts / sims 
+
+    exp_momentum = probs[:,0].sum() 
+
+    return probs, float(exp_momentum) 
+
+ 
+
+# ------------------ BAYESIAN PROGRESS (GOAL) ---------------- 
+
+# Beta-Binomial model for daily success (moving closer to objective) 
+
+# Simple rule: a day counts as "success" if Momentum or if effective key loop meets threshold. 
+
+ 
+
+def beta_binomial_posterior(successes: int, trials: int, a0=1.5, b0=1.5): 
+
+    a = a0 + successes 
+
+    b = b0 + (trials - successes) 
+
+    return a, b 
+
+ 
+
+def success_prob_in_window(a: float, b: float, window_days: int, daily_thresh=0.5) -> float: 
+
+    # Monte Carlo: sample daily success p ~ Beta(a,b); probability get >= some fraction 
+
+    # Here: interpret as chance of accumulating enough “success-days” to hit plan rate. 
+
+    # We return mean p, and rely on ETA estimate for days. 
+
+    return a / (a + b + 1e-9) 
+
+ 
+
+def estimate_eta_ribbon(expected_momentum_days: float, horizon: int = 30) -> Tuple[int,int]: 
+
+    # approximate: median ETA ~ horizon * (target momentum / expected momentum) 
+
+    # Here we assume target momentum ~ 50% of horizon to finish a chunk; we scale bands. 
+
+    # This is heuristic but produces intuitive ribbons. 
+
+    if expected_momentum_days <= 0.1: 
+
+        return (horizon+15, horizon+40) 
+
+    median = max(1, int((horizon * 0.5) / max(0.1, expected_momentum_days/horizon))) 
+
+    low = max(1, int(median*0.8)) 
+
+    high = min(90, int(median*1.3)) 
+
+    return (low, high) 
+
+ 
+
+# ------------- CONTEXTUAL BANDIT (Linear Thompson) ---------- 
+
+def last7_avg_days(days_rows: List[dict], key: str) -> float: 
+
+    vals=[] 
+
+    for d in days_rows[-7:]: 
+
+        eff = json.loads(d.get("eff_loops") or "{}") 
+
+        vals.append(float(eff.get(key,0.0))) 
+
+    return float(np.mean(vals)) if vals else 0.0 
+
+ 
+
+def goal_kind_flags(goal_text: str) -> List[float]: 
+
+    g = (goal_text or "").lower() 
+
+    return [ 
+
+        1.0 if any(w in g for w in ["write","book","essay","draft"]) else 0.0, 
+
+        1.0 if any(w in g for w in ["fit","weight","walk","run","gym"]) else 0.0, 
+
+        1.0 if any(w in g for w in ["save","invest","debt","money"]) else 0.0, 
+
+        1.0 if any(w in g for w in ["learn","study","course","read"]) else 0.0, 
+
+    ] 
+
+ 
+
+def context_vector(days_rows: List[dict], goal_text: str, start_state: str) -> List[float]: 
+
+    onehot = [0.0,0.0,0.0]; onehot[IDX.get(start_state,1)] = 1.0 
+
+    sleep_g  = last7_avg_days(days_rows,"body:sleep_good") 
+
+    late_slp = last7_avg_days(days_rows,"body:late_sleep") 
+
+    scroll   = last7_avg_days(days_rows,"consumption:scroll") 
+
+    exercise = last7_avg_days(days_rows,"body:exercise") 
+
+    writing  = last7_avg_days(days_rows,"creation:writing") 
+
+    gflags   = goal_kind_flags(goal_text) 
+
+    focus_avg = np.mean([(d.get("focus",50) or 50) for d in days_rows[-7:]])/100.0 if days_rows else 0.5 
+
+    return [1.0, *onehot, sleep_g/60.0, late_slp/60.0, scroll/60.0, exercise/60.0, writing/60.0, focus_avg, *gflags] 
+
+ 
+
+def _linreg_posterior(X: np.ndarray, y: np.ndarray, alpha=1.0, sigma2=0.35): 
+
+    d = X.shape[1] 
+
+    A = alpha*np.eye(d) + X.T @ X 
+
+    try: 
+
+        Ainv = np.linalg.inv(A) 
+
+    except np.linalg.LinAlgError: 
+
+        Ainv = np.linalg.pinv(A) 
+
+    mu = Ainv @ (X.T @ y) 
+
+    cov = sigma2 * Ainv 
+
+    return mu, cov 
+
+ 
+
+def _arm_data(uid: str, title: str): 
+
+    rows = fetch("SELECT ctx, reward FROM interventions_log_ctx WHERE user_id=? AND title=? AND reward IS NOT NULL", (uid, title)) 
+
+    X=[]; y=[] 
+
+    for r in rows: 
+
+        try: 
+
+            v = json.loads(r["ctx"]); rr = float(r["reward"]) 
+
+            if isinstance(v, list): 
+
+                X.append(v); y.append(rr) 
+
+        except Exception: 
+
+            pass 
+
+    if not X: return None, None 
+
+    return np.array(X,dtype=float), np.array(y,dtype=float) 
+
+ 
+
+def bandit_scores(uid: str, ctx_vec: List[float], titles: List[str]) -> Dict[str,float]: 
+
+    x = np.array(ctx_vec, dtype=float).reshape(1,-1) 
+
+    scores={} 
+
+    for t in titles: 
+
+        X,y = _arm_data(uid,t) 
+
+        if X is None: 
+
+            scores[t] = 0.55 + np.random.normal(0,0.05) 
+
+        else: 
+
+            mu, cov = _linreg_posterior(X,y) 
+
+            try: 
+
+                theta = np.random.multivariate_normal(mu, cov) 
+
+            except Exception: 
+
+                theta = mu 
+
+            scores[t] = float(x @ theta)[0] 
+
+    return scores 
+
+ 
+
+def log_intervention(uid: str, title: str, accepted=False, helped=None): 
+
+    run("""INSERT INTO interventions_log(user_id,at,title,accepted,helped) 
+
+           VALUES(?,?,?,?,?)""", 
+
+        (uid, dt.datetime.now().isoformat(), title, int(bool(accepted)), 
+
+         (None if helped is None else int(bool(helped))))) 
+
+ 
+
+def log_intervention_ctx(uid: str, title: str, ctx_vec: List[float], helped=None): 
+
+    run("""INSERT INTO interventions_log_ctx(user_id,at,title,ctx,reward) 
+
+           VALUES(?,?,?, ?, ?)""", 
+
+        (uid, dt.datetime.now().isoformat(), title, json.dumps(list(map(float,ctx_vec))), 
+
+         (None if helped is None else (1.0 if helped else 0.0)))) 
+
+ 
+
+# ---------------------- AI HELPERS -------------------------- 
+
+def ai_available(): 
+
+    return (openai is not None) 
+
+ 
+
+def set_openai_key(key: str): 
+
+    if ai_available(): 
+
+        try: 
+
+            openai.api_key = key 
+
+        except Exception: 
+
+            pass 
+
+ 
+
+def ai_narrate_forecast_rich(goal, start_state, focused_days, 
+
+                             likelihood_mid, likelihood_band, 
+
+                             required_pace_delta, milestones, 
+
+                             top_move, top_move_delta, drivers_pos, drivers_neg, 
+
+                             lens_line): 
+
+    # Keep prompt tight. If no API or failure → caller will fall back to local. 
+
+    sys = "You are a concise coach. 1-3 vivid sentences. No bullet points." 
+
+    user = f""" 
+
+Objective: {goal or '—'} 
+
+Start state: {start_state} 
+
+Expected momentum days (30): {focused_days:.1f} 
+
+Chance to hit plan: {likelihood_mid:.2f} (range {likelihood_band[0]:.2f}-{likelihood_band[1]:.2f}) 
+
+Smallest move: {top_move} (+{top_move_delta:.2f} days) 
+
+Tailwinds: {', '.join(drivers_pos or []) or '—'} 
+
+Headwinds: {', '.join(drivers_neg or []) or '—'} 
+
+Lens: {lens_line} 
+
+Write one compact paragraph. Avoid generic advice; speak to the data. 
+
+""" 
+
+    try: 
+
+        r = openai.ChatCompletion.create( 
+
+            model="gpt-4o-mini", 
+
+            messages=[{"role":"system","content":sys}, 
+
+                      {"role":"user","content":user}], 
+
+            temperature=0.7, 
+
+            max_tokens=180 
+
+        ) 
+
+        return r.choices[0].message.content.strip() 
+
+    except Exception: 
+
+        return "" 
+
+ 
+
+# ---------------------- UI HELPERS -------------------------- 
+
+def sticky_header(uid: str): 
+
+    days = fetch("SELECT * FROM days WHERE user_id=? ORDER BY d ASC", (uid,)) 
+
+    if not days: 
+
+        st.markdown("**Today:** no data yet") 
+
+        return 
+
+    today = days[-1] 
+
+    state = today.get("state") or "—" 
+
+    st.markdown(f"**Today** • {state} • Focus {today.get('focus',0):.0f} • Energy {today.get('energy',0):.0f} • Progress {today.get('progress',0):.0f}") 
+
+ 
+
+# ============================================================ 
+
+# APP START — AUTH 
+
+# ============================================================ 
+
+st.title("⏳ TimeSculpt") 
+
+st.caption("A recursive, goal-centric field engine for personal transformation.") 
+
+ 
+
+st.sidebar.header("Profile") 
+
+profile=None 
+
+mode = st.sidebar.radio("Session", ["Login","Create"], horizontal=True) 
+
+if mode=="Create": 
+
+    n = st.sidebar.text_input("Name") 
+
+    p = st.sidebar.text_input("PIN (numbers ok)", type="password") 
+
+    if st.sidebar.button("Create profile"): 
+
+        if n and p: 
+
+            uid = create_profile(n,p) 
+
+            st.session_state["uid"] = uid 
+
+            profile = get_profile(uid) 
+
+elif mode=="Login": 
+
+    n = st.sidebar.text_input("Name") 
+
+    p = st.sidebar.text_input("PIN", type="password") 
+
+    if st.sidebar.button("Login"): 
+
+        pr = auth_profile(n,p) 
+
+        if pr: 
+
+            st.session_state["uid"] = pr["id"] 
+
+            profile = pr 
+
+if "uid" in st.session_state and not profile: 
+
+    profile = get_profile(st.session_state["uid"]) 
+
+if not profile: 
+
+    st.info("Login or create a profile to continue.") 
+
+    st.stop() 
+
+uid = profile["id"] 
+
+ 
+
+# AI Toggle + Key 
+
+st.sidebar.header("AI") 
+
+USE_AI = st.sidebar.toggle("Enable AI narration", value=False) 
+
+if USE_AI: 
+
+    st.sidebar.success("AI Active") 
+
+else: 
+
+    st.sidebar.info("AI Inactive") 
+
+ 
+
+api_input = st.sidebar.text_input("API key (optional, stored with profile)", type="password", 
+
+                                  help="Paste your OpenAI-compatible key here to enable AI narration.") 
+
+if api_input: 
+
+    run("UPDATE profiles SET api_key=? WHERE id=?", (api_input, uid)) 
+
+prof_now = get_profile(uid) 
+
+if prof_now and prof_now.get("api_key"): 
+
+    set_openai_key(prof_now["api_key"]) 
+
+ 
+
+# ============================================================ 
+
+# TABS 
+
+# ============================================================ 
+
+tabs = st.tabs([ 
+
+    "Input", "Forecast", "Interventions", 
+
+    "Diagnostics", "Lenses", "Future Self", "Settings" 
+
+]) 
+
+ 
+
+# ---------------------- INPUT TAB --------------------------- 
+
+with tabs[0]: 
+
+    st.header("Daily Input") 
+
+    sticky_header(uid) 
+
+ 
+
+    # Active goal 
+
+    st.subheader("Objective") 
+
+    goal_row = get_active_goal(uid) 
+
+    if goal_row: 
+
+        st.success(f"Active objective: **{goal_row['objective']}** · Target: **{goal_row['target']} {goal_row['unit']}** · Horizon: **{goal_row['horizon_days']} days**") 
+
+    else: 
+
+        st.warning("No active objective. Set one in Settings → Objective.") 
+
+ 
+
+    # Built-in + custom loops catalog 
+
+    catalog = get_loop_catalog(uid) 
+
+    pos_names = {c["name"] for c in catalog if c["polarity"]>0} 
+
+    neg_names = {c["name"] for c in catalog if c["polarity"]<0} 
+
+ 
+
+    # Logging form 
+
+    st.subheader("Log today") 
+
+    d = st.date_input("Date", value=dt.date.today()).isoformat() 
+
+    cols = st.columns(4) 
+
+    raw_loops = {} 
+
+    preview_texts = [] 
+
+ 
+
+    # show a subset grid (common) + custom list below 
+
+    common = [ 
+
+        "creation:writing","creation:project","mind:reading","mind:planning", 
+
+        "mind:meditation","body:walk","body:exercise","body:sleep_good", 
+
+        "body:late_sleep","consumption:scroll","finance:save_invest","finance:budget_check" 
+
+    ] 
+
+    cat_map = {c["name"]: c for c in catalog} 
+
+    def input_one(name, col): 
+
+        meta = cat_map.get(name) 
+
+        if not meta: return 
+
+        unit = meta["unit"]; rate = meta["rate"] 
+
+        label = f"{name.split(':',1)[1]} ({unit})" 
+
+        with col: 
+
+            val = st.number_input(label, min_value=0.0, step=1.0, key=f"log_{name}") 
+
+            raw_loops[name] = (unit, rate, val) 
+
+            eff = normalize_amount(unit, val, rate) 
+
+            if val>0: 
+
+                preview_texts.append(f"{label}: {val} → counts as {eff:.1f} effective min") 
+
+ 
+
+    for i, name in enumerate(common): 
+
+        input_one(name, cols[i%4]) 
+
+ 
+
+    # Custom loops 
+
+    st.markdown("**Custom loops**") 
+
+    custom_names = [c["name"] for c in catalog if not c["builtin"]] 
+
+    if custom_names: 
+
+        ccols = st.columns(4) 
+
+        for idx, name in enumerate(custom_names): 
+
+            input_one(name, ccols[idx%4]) 
+
+    else: 
+
+        st.caption("No custom loops yet. Add in Settings.") 
+
+ 
+
+    if preview_texts: 
+
+        st.caption("Conversion preview:") 
+
+        st.write(" • " + "\n • ".join(preview_texts)) 
+
+ 
+
+    note = st.text_area("Note (optional)") 
+
+ 
+
+    if st.button("Commit today"): 
+
+        # compute effective loops map 
+
+        eff = {k: normalize_amount(u, v, r) for k,(u,r,v) in raw_loops.items()} 
+
+        state, F, E, P, micro = label_state(eff, pos_names, neg_names) 
+
+        run("""INSERT INTO days(user_id,d,loops,eff_loops,note,focus,energy,progress,state) 
+
+               VALUES(?,?,?,?,?,?,?,?,?)""", 
+
+            (uid, d, json.dumps({k: raw_loops[k][2] for k in raw_loops}), json.dumps(eff), note, F, E, P, state)) 
+
+        field_set(uid, "loops", {"last_entry": eff, "state": state, "micro": micro, "F": F, "E": E, "P": P, "d": d}) 
+
+        st.success(f"Saved. Today labeled **{state}**. {micro}") 
+
+ 
+
+# ---------------------- FORECAST TAB ------------------------ 
+
+with tabs[1]: 
+
+    st.header("30-Day Forecast (Goal-centric)") 
+
+    days_rows = fetch("SELECT * FROM days WHERE user_id=? ORDER BY d ASC", (uid,)) 
+
+    if not days_rows: 
+
+        st.info("No days logged yet. Add at least one day in Input.") 
+
+    else: 
+
+        # compute classical baseline 
+
+        M = learn_matrix(days_rows) 
+
+        start = days_rows[-1].get("state","Mixed") 
+
+        probs, exp_momentum_days = simulate(M, start, days=30, sims=1800) 
+
+ 
+
+        # 14-day sparkline + quick stats 
+
+        last14 = days_rows[-14:] 
+
+        df14 = pd.DataFrame([{"d": r["d"], "focus": r.get("focus",0)} for r in last14]) if last14 else pd.DataFrame({"d":[],"focus":[]}) 
+
+        c1,c2,c3 = st.columns([2,1,1]) 
+
+        with c1: 
+
+            st.caption("Last 14 days — Focus trend") 
+
+            if not df14.empty: 
+
+                st.altair_chart( 
+
+                    alt.Chart(df14).mark_line(point=True).encode( 
+
+                        x="d:T", y="focus:Q" 
+
+                    ).properties(height=80), 
+
+                    use_container_width=True 
+
+                ) 
+
+            else: 
+
+                st.caption("No recent data") 
+
+        with c2: 
+
+            st.metric("Expected Momentum days (30d)", f"{probs[:,0].sum():.1f}") 
+
+        with c3: 
+
+            st.metric("Current state", start) 
+
+ 
+
+        # Goal info 
+
+        goal = get_active_goal(uid) 
+
+        goal_text = goal["objective"] if goal else "" 
+
+        horizon = int(goal["horizon_days"] if goal else 30) 
+
+        unit_label = (goal["unit"] if goal else "units") 
+
+        target_total = float(goal["target"] if goal else 0.0) 
+
+ 
+
+        # Momentum-driven ETA ribbon (approx) 
+
+        eta_lo, eta_hi = estimate_eta_ribbon(exp_momentum_days, horizon=horizon) 
+
+ 
+
+        # Beta-Binomial progress — define success as Momentum day 
+
+        succ = int(round(probs[:,0].sum()))  # expected succ days ~ sum of daily momentum probs 
+
+        trials = 30 
+
+        a,b = beta_binomial_posterior(succ, trials, a0=1.5, b0=1.5) 
+
+        lik_mid = a / (a+b+1e-9) 
+
+        lik_lo = max(0.0, lik_mid - 0.07); lik_hi = min(1.0, lik_mid + 0.07) 
+
+ 
+
+        # Drivers (simple): top +/− eff loops averages 
+
+        eff_map = {} 
+
+        for r in days_rows[-14:]: 
+
+            eff = json.loads(r.get("eff_loops") or "{}") 
+
+            for k,v in eff.items(): 
+
+                eff_map.setdefault(k,[]).append(v) 
+
+        avg_eff = {k: np.mean(v) for k,v in eff_map.items()} 
+
+        top_pos = sorted([(k,v) for k,v in avg_eff.items() if "consumption:" not in k and "late_sleep" not in k and "impulse_spend" not in k], key=lambda x:-x[1])[:3] 
+
+        top_neg = sorted([(k,v) for k,v in avg_eff.items() if ("consumption:" in k or "late_sleep" in k or "impulse_spend" in k)], key=lambda x:-x[1])[:3] 
+
+        drivers_pos = [f"{k.split(':',1)[1]}↑" for k,_ in top_pos] 
+
+        drivers_neg = [f"{k.split(':',1)[1]}↑" for k,_ in top_neg] 
+
+ 
+
+        # Interventions pool (tiny demo set; you can expand) 
+
+        POOL = [ 
+
+            {"title":"7-min starter","how":"Start badly. Stop after 7.","tags":["creation"],"tweak":{"m_to_f":+0.06}}, 
+
+            {"title":"15-min walk","how":"Swap one scroll for a walk.","tags":["body"],"tweak":{"m_to_f":+0.05,"d_self":-0.03}}, 
+
+            {"title":"Sleep before midnight","how":"Shut down 30 min earlier.","tags":["body"],"tweak":{"d_self":-0.06}}, 
+
+            {"title":"Pay-yourself-first 10%","how":"Automate right after payday.","tags":["finance"],"tweak":{"m_to_f":+0.05}}, 
+
+        ] 
+
+ 
+
+        # Context + bandit scores 
+
+        ctx_vec = context_vector(days_rows, goal_text, start) 
+
+        titles = [iv["title"] for iv in POOL] 
+
+        ctx_scores = bandit_scores(uid, ctx_vec, titles) 
+
+ 
+
+        # Compute deltas: simply boost expected momentum by bandit score * small factor for demo 
+
+        base_focus_days = probs[:,0].sum() 
+
+        scored = [] 
+
+        for iv in POOL: 
+
+            bscore = ctx_scores.get(iv["title"], 0.5) 
+
+            delta = min(2.0, max(0.0, (bscore-0.5)*2.5))  # map ~0.0..1.0 → 0..1.25 days, cap 
+
+            scored.append({"iv":iv, "delta":delta, "score":bscore}) 
+
+        scored.sort(key=lambda r:-r["delta"]) 
+
+        best = scored[0] if scored else None 
+
+ 
+
+        # Multi-lens smart line for the brief (no explanation text) 
+
+        lenses_state = field_get(uid,"lenses",{}) or {} 
+
+        active_primary = lenses_state.get("active_primary","Core") 
+
+        active_secondary = lenses_state.get("active_secondary","") 
+
+        lens_line = smart_lens_line(uid, "emergence", {"goal": goal_text, "state": start}, active_primary, active_secondary) 
+
+ 
+
+        # Rich brief (AI if on, else local) 
+
+        brief_text = "" 
+
+        if USE_AI and prof_now and prof_now.get("api_key") and ai_available(): 
+
+            brief_text = ai_narrate_forecast_rich( 
+
+                goal=goal_text, start_state=start, focused_days=float(base_focus_days), 
+
+                likelihood_mid=lik_mid, likelihood_band=(lik_lo,lik_hi), 
+
+                required_pace_delta=0.3, milestones=["Next chapter","Submit draft"], 
+
+                top_move=(best["iv"]["title"] if best else "—"), 
+
+                top_move_delta=(best["delta"] if best else 0.0), 
+
+                drivers_pos=drivers_pos, drivers_neg=drivers_neg, 
+
+                lens_line=lens_line 
+
+            ) 
+
+        if not brief_text: 
+
+            brief_text = f"{lens_line}  " + ( 
+
+                f"At this pace, you’re about **{lik_mid:.0%}** likely to stay on plan. " 
+
+                f"Median ETA ~ **{eta_lo}** days (80% by ~**{eta_hi}**). " 
+
+                f"Try **{(best['iv']['title'] if best else 'a tiny move')}** to tighten the curve." 
+
+            ) 
+
+ 
+
+        st.subheader("Forecast brief") 
+
+        st.markdown(f"<div class='card'>{brief_text}</div>", unsafe_allow_html=True) 
+
+ 
+
+        # Comparison: do nothing vs apply top move (simple illustrative shift) 
+
+        st.subheader("Compare") 
+
+        cA, cB = st.columns(2) 
+
+        with cA: 
+
+            st.markdown("**If you do nothing**") 
+
+            st.caption(f"Expected Momentum days: {base_focus_days:.1f} / 30") 
+
+        with cB: 
+
+            if best: 
+
+                st.markdown(f"**If you apply: _{best['iv']['title']}_**") 
+
+                st.caption(f"Expected Momentum days: {(base_focus_days + best['delta']):.1f} / 30 (Δ +{best['delta']:.2f})") 
+
+            else: 
+
+                st.caption("No interventions available.") 
+
+ 
+
+        # Save field_state for other tabs 
+
+        field_set(uid,"forecast",{ 
+
+            "brief": brief_text, 
+
+            "lik": [lik_lo, lik_mid, lik_hi], 
+
+            "eta": [eta_lo, eta_hi], 
+
+            "base_momentum_days": base_focus_days, 
+
+            "top_move": (best["iv"]["title"] if best else ""), 
+
+            "top_move_delta": (best["delta"] if best else 0.0) 
+
+        }) 
+
+ 
+
+# ------------------- INTERVENTIONS TAB ---------------------- 
+
+with tabs[2]: 
+
+    st.header("Interventions (Contextual)") 
+
+    days_rows = fetch("SELECT * FROM days WHERE user_id=? ORDER BY d ASC", (uid,)) 
+
+    if not days_rows: 
+
+        st.info("Log some days first.") 
+
+    else: 
+
+        start = days_rows[-1].get("state","Mixed") 
+
+        goal = get_active_goal(uid) 
+
+        goal_text = goal["objective"] if goal else "" 
+
+        # pool (same for demo) 
+
+        POOL = [ 
+
+            {"title":"7-min starter","how":"Start badly. Stop after 7.","tags":["creation"]}, 
+
+            {"title":"15-min walk","how":"Swap one scroll for a walk.","tags":["body"]}, 
+
+            {"title":"Sleep before midnight","how":"Shut down 30 min earlier.","tags":["body"]}, 
+
+            {"title":"Pay-yourself-first 10%","how":"Automate right after payday.","tags":["finance"]}, 
+
+        ] 
+
+        titles = [p["title"] for p in POOL] 
+
+        ctx_vec = context_vector(days_rows, goal_text, start) 
+
+        scores = bandit_scores(uid, ctx_vec, titles) 
+
+        ranked = sorted(POOL, key=lambda iv:-scores.get(iv["title"],0.5)) 
+
+ 
+
+        # Top suggestion card 
+
+        top = ranked[0] 
+
+        st.markdown("### ⭐ Top move") 
+
+        st.markdown("<div class='card'>", unsafe_allow_html=True) 
+
+        st.write(f"**{top['title']}** — {top['how']}") 
+
+        st.caption(f"Context score: {scores.get(top['title'],0.5):.2f}") 
+
+        colA, colB, colC = st.columns([1,1,2]) 
+
+        with colA: 
+
+            if st.button("Apply", key="apply_top"): 
+
+                log_intervention(uid, top["title"], accepted=True) 
+
+                log_intervention_ctx(uid, top["title"], ctx_vec, helped=None) 
+
+                field_set(uid,"interventions",{"last_applied": top["title"], "ctx": ctx_vec}) 
+
+                st.success("Applied.") 
+
+        with colB: 
+
+            fb = st.selectbox("Did it help?", ["Skip","Yes","No"], key="fb_top") 
+
+            if fb != "Skip": 
+
+                helped = (fb=="Yes") 
+
+                log_intervention(uid, top["title"], accepted=True, helped=helped) 
+
+                log_intervention_ctx(uid, top["title"], ctx_vec, helped=helped) 
+
+                st.success("Feedback saved.") 
+
+        with colC: 
+
+            st.caption("Why this now?") 
+
+            loops_field = field_get(uid,"loops",{}) or {} 
+
+            st.markdown(f"<span class='badge'>{(loops_field.get('micro') or '—')}</span>", unsafe_allow_html=True) 
+
+        st.markdown("</div>", unsafe_allow_html=True) 
+
+ 
+
+        # More options 
+
+        st.markdown("### More options") 
+
+        for iv in ranked[1:]: 
+
+            with st.expander(iv["title"]): 
+
+                st.write(iv["how"]) 
+
+                st.caption(f"Context score: {scores.get(iv['title'],0.5):.2f}") 
+
+                c1,c2 = st.columns([1,3]) 
+
+                with c1: 
+
+                    if st.button("Apply", key=f"apply_{iv['title']}"): 
+
+                        log_intervention(uid, iv["title"], accepted=True) 
+
+                        log_intervention_ctx(uid, iv["title"], ctx_vec, helped=None) 
+
+                        st.success("Applied.") 
+
+                with c2: 
+
+                    fb = st.selectbox("Did it help?", ["Skip","Yes","No"], key=f"fb_{iv['title']}") 
+
+                    if fb!="Skip": 
+
+                        helped = (fb=="Yes") 
+
+                        log_intervention(uid, iv["title"], accepted=True, helped=helped) 
+
+                        log_intervention_ctx(uid, iv["title"], ctx_vec, helped=helped) 
+
+                        st.success("Feedback saved.") 
+
+ 
+
+        # Proven for you leaderboard 
+
+        st.subheader("Proven for you") 
+
+        rows = fetch("""SELECT title, AVG(CASE WHEN reward IS NOT NULL THEN reward ELSE NULL END) AS success_rate, 
+
+                        COUNT(*) AS trials 
+
+                        FROM interventions_log_ctx WHERE user_id=? GROUP BY title ORDER BY success_rate DESC""", (uid,)) 
+
+        if rows: 
+
+            df = pd.DataFrame(rows) 
+
+            df["success_rate"] = df["success_rate"].fillna(0) 
+
+            st.dataframe(df.style.format({"success_rate":"{:.2f}"}), use_container_width=True) 
+
+        else: 
+
+            st.caption("No feedback yet.") 
+
+ 
+
+# --------------------- DIAGNOSTICS TAB ---------------------- 
+
+with tabs[3]: 
+
+    st.header("Diagnostics") 
+
+    st.caption("Force (+) = loops that correlate with Momentum days. Drag (−) = loops correlated with Stuck days.") 
+
+    days_rows = fetch("SELECT * FROM days WHERE user_id=? ORDER BY d ASC", (uid,)) 
+
+    if len(days_rows) < 5: 
+
+        st.info("Log more days for diagnostics.") 
+
+    else: 
+
+        data=[] 
+
+        for d in days_rows: 
+
+            eff = json.loads(d.get("eff_loops") or "{}") 
+
+            row={"d": d["d"], "state": d.get("state","Mixed")} 
+
+            row.update(eff); data.append(row) 
+
+        df = pd.DataFrame(data) 
+
+        # Pivot mean minutes by state 
+
+        pivot = df.drop(columns=["d"]).groupby("state").mean(numeric_only=True).T.fillna(0.0) 
+
+        # pad columns 
+
+        for s in STATES: 
+
+            if s not in pivot.columns: 
+
+                pivot[s] = 0.0 
+
+        pivot["lift"] = pivot["Momentum"] - pivot["Stuck"] 
+
+        best = pivot.sort_values("lift", ascending=False).head(5) 
+
+        worst = pivot.sort_values("lift", ascending=True).head(5) 
+
+        c1,c2 = st.columns(2) 
+
+        with c1: 
+
+            st.subheader("Force (+)") 
+
+            st.dataframe(best[["lift","Momentum","Stuck"]]) 
+
+        with c2: 
+
+            st.subheader("Drag (−)") 
+
+            st.dataframe(worst[["lift","Momentum","Stuck"]]) 
+
+ 
+
+# ----------------------- LENSES TAB ------------------------- 
+
+with tabs[4]: 
+
+    st.header("Lenses") 
+
+    st.caption("Upload texts (txt/docx/pdf) to feed narration. You may select a primary and secondary lens.") 
+
+    # Upload 
+
+    up = st.file_uploader("Upload lens file", type=["txt","docx","pdf"]) 
+
+    lname = st.text_input("Lens name", value="My Lens") 
+
+    if st.button("Add Lens") and up and lname.strip(): 
+
+        parts = parse_lens_file(up) 
+
+        run("INSERT INTO lenses(user_id,name,data) VALUES(?,?,?)", (uid, lname.strip(), json.dumps(parts))) 
+
+        st.success("Lens added.") 
+
+ 
+
+    # Active selection 
+
+    all_l = lenses_for_user(uid) 
+
+    prim = st.selectbox("Primary lens", options=list(all_l.keys()), index=list(all_l.keys()).index("Core") if "Core" in all_l else 0) 
+
+    sec_opt = ["(none)"] + [k for k in all_l.keys() if k != prim] 
+
+    sec = st.selectbox("Secondary lens (optional)", options=sec_opt, index=0) 
+
+    active_secondary = "" if sec=="(none)" else sec 
+
+    field_set(uid,"lenses", {"active_primary": prim, "active_secondary": active_secondary}) 
+
+    st.caption("Status: saved to field state.") 
+
+ 
+
+    # Preview a line 
+
+    if st.button("Preview emergence line"): 
+
+        goal = get_active_goal(uid) 
+
+        gl = goal["objective"] if goal else "" 
+
+        line = smart_lens_line(uid, "emergence", {"goal": gl, "state":"—"}, prim, active_secondary) 
+
+        st.markdown(f"> {line}") 
+
+ 
+
+# --------------------- FUTURE SELF TAB ---------------------- 
+
+with tabs[5]: 
+
+    st.header("Future Self") 
+
+    rows = fetch("SELECT * FROM future_self WHERE user_id=?", (uid,)) 
+
+    fs = rows[0] if rows else {} 
+
+    fs_title = st.text_input("Future Self title", value=fs.get("title","")) 
+
+    fs_traits = st.text_area("Traits (comma separated)", value=fs.get("traits","")) 
+
+    fs_rituals = st.text_area("Rituals (comma separated)", value=fs.get("rituals","")) 
+
+    if st.button("Save Future Self"): 
+
+        run("DELETE FROM future_self WHERE user_id=?", (uid,)) 
+
+        run("INSERT INTO future_self(user_id,title,traits,rituals) VALUES(?,?,?,?)", 
+
+            (uid, fs_title, fs_traits, fs_rituals)) 
+
+        field_set(uid,"future_self", {"title": fs_title, "traits": fs_traits, "rituals": fs_rituals}) 
+
+        st.success("Future Self saved.") 
+
+ 
+
+    st.subheader("SMART Challenges") 
+
+    ch_title = st.text_input("Challenge title") 
+
+    ch_why = st.text_area("Why this matters (motivation)") 
+
+    ch_smart = st.text_area("SMART definition") 
+
+    ch_due = st.date_input("Due on", value=dt.date.today()) 
+
+    if st.button("Add challenge") and ch_title.strip(): 
+
+        run("""INSERT INTO future_challenges(user_id,title,why,smart,due_on,progress,status) 
+
+               VALUES(?,?,?,?,?,?,?)""", 
+
+            (uid, ch_title.strip(), ch_why.strip(), ch_smart.strip(), ch_due.isoformat(), 0.0, "active")) 
+
+        st.success("Challenge added.") 
+
+ 
+
+    # list challenges 
+
+    chs = fetch("SELECT * FROM future_challenges WHERE user_id=? ORDER BY id DESC", (uid,)) 
+
+    for ch in chs: 
+
+        with st.expander(f"{ch['title']}  ·  {ch['status']} · due {ch['due_on']}"): 
+
+            st.caption(ch["smart"]) 
+
+            prog = st.slider("Progress", 0.0, 1.0, float(ch.get("progress",0.0)), 0.05, key=f"prog_{ch['id']}") 
+
+            st.write("Why:", ch.get("why","")) 
+
+            c1,c2,c3 = st.columns(3) 
+
+            with c1: 
+
+                if st.button("Save progress", key=f"savep_{ch['id']}"): 
+
+                    run("UPDATE future_challenges SET progress=? WHERE id=?", (prog, ch["id"])) 
+
+                    st.success("Updated.") 
+
+            with c2: 
+
+                if st.button("Complete", key=f"cmpl_{ch['id']}"): 
+
+                    run("UPDATE future_challenges SET status='completed', progress=1.0 WHERE id=?", (ch["id"],)) 
+
+                    st.success("Marked completed.") 
+
+            with c3: 
+
+                if st.button("Redo", key=f"redo_{ch['id']}"): 
+
+                    run("UPDATE future_challenges SET status='active', progress=0.0 WHERE id=?", (ch["id"],)) 
+
+                    st.success("Reset.") 
+
+ 
+
+    st.subheader("Letter to your past self") 
+
+    letter = st.text_area("Write the letter") 
+
+    reveal = st.date_input("Reveal on", value=dt.date.today()) 
+
+    if st.button("Save letter") and letter.strip(): 
+
+        run("""INSERT INTO future_letters(user_id,content,created_at,reveal_on,revealed) 
+
+               VALUES(?,?,?,?,0)""", 
+
+            (uid, letter.strip(), dt.date.today().isoformat(), reveal.isoformat())) 
+
+        st.success("Saved.") 
+
+ 
+
+    # Resurface letters that are due and not revealed 
+
+    due = fetch("""SELECT * FROM future_letters 
+
+                   WHERE user_id=? AND revealed=0 AND reveal_on<=? 
+
+                   ORDER BY id ASC""", (uid, dt.date.today().isoformat())) 
+
+    if due: 
+
+        st.subheader("A letter returns") 
+
+        st.markdown(f"<div class='card'><em>{due[0]['content']}</em></div>", unsafe_allow_html=True) 
+
+        if st.button("Mark as seen", key="seen_letter"): 
+
+            run("UPDATE future_letters SET revealed=1 WHERE id=?", (due[0]["id"],)) 
+
+ 
+
+# ----------------------- SETTINGS TAB ----------------------- 
+
+with tabs[6]: 
+
+    st.header("Settings") 
+
+    st.subheader("Objective") 
+
+    cur = get_active_goal(uid) 
+
+    obj = st.text_input("Objective", value=(cur["objective"] if cur else "")) 
+
+    unit = st.selectbox("Unit", ["minutes","hours","pages","chapters","reps","£","%","units"], index=(["minutes","hours","pages","chapters","reps","£","%","units"].index(cur["unit"]) if cur else 0)) 
+
+    target = st.number_input("Target total (how much to reach)", min_value=0.0, value=(float(cur["target"]) if cur else 0.0), step=1.0) 
+
+    horizon = st.number_input("Forecast horizon (days)", min_value=7, value=(int(cur["horizon_days"]) if cur else 30), step=1) 
+
+    if st.button("Save objective"): 
+
+        if obj.strip() and target>0: 
+
+            set_goal(uid, obj.strip(), unit, target, int(horizon)) 
+
+            st.success("Objective saved.") 
+
+        else: 
+
+            st.warning("Enter objective and a positive target.") 
+
+ 
+
+    st.subheader("Custom loops") 
+
+    cname = st.text_input("Name") 
+
+    ccat = st.selectbox("Category", ["creation","mind","body","consumption","food","finance","other"]) 
+
+    cpol = st.selectbox("Polarity", [+1,-1], index=0) 
+
+    cunit = st.selectbox("Unit", list(UNIT_DEFAULT_RATE.keys()), index=0) 
+
+    crate = st.number_input("Rate (auto-set by unit; override if you wish)", min_value=0.0, value=float(UNIT_DEFAULT_RATE.get(cunit,1.0))) 
+
+    if st.button("Add custom loop"): 
+
+        if cname.strip(): 
+
+            run("""INSERT INTO custom_loops(user_id,name,category,polarity,unit,rate) 
+
+                   VALUES(?,?,?,?,?,?)""", (uid, cname.strip(), ccat, int(cpol), cunit, float(crate))) 
+
+            st.success("Custom loop added.") 
+
+        else: 
+
+            st.warning("Give your loop a name.") 
+
+ 
+
+    # Export/Import simple JSON dump 
+
+    st.subheader("Export / Import") 
+
+    if st.button("Export JSON"): 
+
+        # dump minimal tables 
+
+        days = fetch("SELECT * FROM days WHERE user_id=?", (uid,)) 
+
+        lenses_db = fetch("SELECT * FROM lenses WHERE user_id=?", (uid,)) 
+
+        customs = fetch("SELECT * FROM custom_loops WHERE user_id=?", (uid,)) 
+
+        fs = fetch("SELECT * FROM future_self WHERE user_id=?", (uid,)) 
+
+        ch = fetch("SELECT * FROM future_challenges WHERE user_id=?", (uid,)) 
+
+        let = fetch("SELECT * FROM future_letters WHERE user_id=?", (uid,)) 
+
+        goal = get_active_goal(uid) 
+
+        dump = {"days": days, "lenses": lenses_db, "custom_loops": customs, 
+
+                "future_self": fs, "future_challenges": ch, "future_letters": let, 
+
+                "goal": goal} 
+
+        st.download_button("Download", data=json.dumps(dump, indent=2), file_name="timesculpt_export.json") 
+
+    imp = st.file_uploader("Import JSON", type=["json"]) 
+
+    if imp and st.button("Import now"): 
+
+        try: 
+
+            data = json.loads(imp.read().decode("utf-8")) 
+
+            # naive import: append rows (avoid dup keys) 
+
+            for r in data.get("days", []): 
+
+                run("""INSERT INTO days(user_id,d,loops,eff_loops,note,focus,energy,progress,state) 
+
+                       VALUES(?,?,?,?,?,?,?,?,?)""", 
+
+                    (uid, r["d"], r.get("loops"), r.get("eff_loops"), r.get("note"), r.get("focus"), r.get("energy"), r.get("progress"), r.get("state"))) 
+
+            for r in data.get("lenses", []): 
+
+                run("INSERT INTO lenses(user_id,name,data) VALUES(?,?,?)", (uid, r["name"], r["data"])) 
+
+            for r in data.get("custom_loops", []): 
+
+                run("INSERT INTO custom_loops(user_id,name,category,polarity,unit,rate) VALUES(?,?,?,?,?,?)", 
+
+                    (uid, r["name"], r["category"], r["polarity"], r["unit"], r["rate"])) 
+
+            for r in data.get("future_self", []): 
+
+                run("INSERT INTO future_self(user_id,title,traits,rituals) VALUES(?,?,?,?)", 
+
+                    (uid, r["title"], r["traits"], r["rituals"])) 
+
+            for r in data.get("future_challenges", []): 
+
+                run("""INSERT INTO future_challenges(user_id,title,why,smart,due_on,progress,status) 
+
+                       VALUES(?,?,?,?,?,?,?)""", 
+
+                    (uid, r["title"], r["why"], r["smart"], r["due_on"], r["progress"], r["status"])) 
+
+            for r in data.get("future_letters", []): 
+
+                run("""INSERT INTO future_letters(user_id,content,created_at,reveal_on,revealed) 
+
+                       VALUES(?,?,?,?,?)""", 
+
+                    (uid, r["content"], r["created_at"], r["reveal_on"], r["revealed"])) 
+
+            g = data.get("goal") 
+
+            if g: 
+
+                set_goal(uid, g["objective"], g["unit"], float(g["target"]), int(g["horizon_days"])) 
+
+            st.success("Import complete.") 
+
+        except Exception as e: 
+
+            st.error(f"Import failed: {e}") 
+
+ 
+
+# ========================= END ============================== 
