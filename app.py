@@ -886,9 +886,9 @@ with tabs[1]:
         ctx_vec = context_vector(days_rows, goal_text, start)
         titles = [iv["title"] for iv in POOL]
         try:
-        ctx_scores = bandit_scores(ctx_vec, titles)
-    except Exception:
-        ctx_scores = {t: 0.5 for t in titles}
+    ctx_scores = bandit_scores(ctx_vec, titles)
+except Exception:
+    ctx_scores = {t: 0.5 for t in titles}
 
         # Compute deltas: simply boost expected momentum by bandit score * small factor for demo
         base_focus_days = probs[:,0].sum()
@@ -971,9 +971,9 @@ with tabs[2]:
         titles = [p["title"] for p in POOL]
         ctx_vec = context_vector(days_rows, goal_text, start)
         try:
-        scores = bandit_scores(ctx_vec, titles)
-    except Exception:
-        scores = {t: 0.5 for t in titles}
+    scores = bandit_scores(ctx_vec, titles)
+except Exception:
+    scores = {t: 0.5 for t in titles}
         ranked = sorted(POOL, key=lambda iv:-scores.get(iv["title"],0.5))
 
         # Top suggestion card
