@@ -125,19 +125,37 @@ tabs = {
 choice = st.sidebar.radio("Navigate", list(tabs.keys()), format_func=lambda x: tabs[x])
 
 if choice == "Guide":
-    st.title("TimeSculpt")
-    st.subheader("📖 About")
-    st.markdown("Align Future Self identity, daily loops, and probability forecasts.")
-    st.subheader("🧭 How to Use")
+    st.title("🧭 TimeSculpt — Instructional Guide")
+    st.subheader("Opening Transmission")
+    st.markdown("**TimeSculpt is not a tracker. It is a sculptor’s tool.** Each log, each loop, each choice bends probability toward the self you’ve already chosen.")
+    st.subheader("📌 Visual Roadmap")
+    st.markdown("📂 Profiles → 🌌 Future Self → 🎯 Goals → 🌀 Loops → 📊 Forecast → 🎯 Interventions → 📈 Diagnostics → 📖 Lens → ⚙️ Settings")
+    st.subheader("📂 Profiles")
+    st.markdown("Create and secure your profile with a name + PIN. Switch between profiles easily. Each profile stores its own traits, goals, loops, and forecasts.")
+    st.subheader("🌌 Future Self")
+    st.markdown("Define traits and write letters from your Future Self. Attach goals with deadlines and priorities. Example: Trait = Disciplined. Letter = ‘I already finished the book.’")
+    st.subheader("🎯 Goals")
+    st.markdown("Attach measurable targets to your Future Self. Example: Write 40,000 words by June 1st. Prioritize goals to focus Forecast and Interventions.")
+    st.subheader("🌀 Input (Loops)")
+    st.markdown("Log daily activities. Even 5 minutes counts. Loops are timestamped and feed Forecast and Diagnostics. Example: Writing 20 minutes → moves Writing Goal forward.")
+    st.subheader("📊 Forecast")
+    st.markdown("Shows progress toward goals with percentages, countdowns, and ETA projections. Styled charts track momentum. Lens lines echo narrative guidance.")
+    st.subheader("🎯 Interventions")
+    st.markdown("Suggests the smallest next move to bend trajectory toward your Future Self. Example: Add 200 words today. AI can expand into strategies if enabled.")
+    st.subheader("📈 Diagnostics")
+    st.markdown("Analyzes your logged loops to show Forces (positive drivers) and Drags (negative patterns). Example: Morning Writing = Force. Late Sleep = Drag.")
+    st.subheader("📖 Lens")
+    st.markdown("Upload or add guiding lines. These resurface in Forecast, Interventions, and Diagnostics as echoes, shaping narrative and reinforcing identity.")
+    st.subheader("⚙️ Settings")
+    st.markdown("Manage profiles, AI API key, and enable/disable AI narration. Each profile keeps its own AI toggle and key.")
+    st.subheader("✅ Daily Flow Checklist")
     st.markdown("""
-    - **Settings:** Create/select profiles, manage AI.  
-    - **Future Self:** Traits, letters, goals.  
-    - **Input:** Log loops with date & time.  
-    - **Forecast:** Goal progress, countdowns, ETA, charts.  
-    - **Interventions:** Smallest moves suggested.  
-    - **Diagnostics:** Forces & drags from loops.  
-    - **Lens:** Upload/add guiding lines.  
+    - Morning: 🔮 Check Forecast + Lens echo.  
+    - Daytime: 🌀 Log loops + 🎯 Apply interventions.  
+    - Evening: 📈 Review Diagnostics + refine 🎯 Goals + write 🌌 Future Self letters.  
     """)
+    st.subheader("📈 Expectation")
+    st.markdown("With consistent use, TimeSculpt sharpens clarity, aligns identity with action, and provides probability-based forecasts that shape real outcomes.")
 
 elif choice == "Future Self":
     profiles = get_profiles()
