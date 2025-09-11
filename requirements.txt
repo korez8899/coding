@@ -3,3 +3,4 @@ bcrypt
 numpy
 matplotlib
 python-docx
+PyPDF2
