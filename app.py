@@ -8,7 +8,6 @@ import sqlite3
 from datetime import datetime, date, time
 import hashlib
 import pandas as pd
-import plotly.express as px
 import random
 import re
 
