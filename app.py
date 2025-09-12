@@ -1,383 +1,691 @@
-# TimeSculpt – Final Production Build
-# Features: Profiles, Future Self, Goals, Loops, Forecast, Interventions, Diagnostics, Lens, Settings, Guide
-# Theme: Cosmic Night (default) + Aurora Light toggle
-# Tab icons + larger inviting text
-
+# ================================================
+# TimeSculpt – Phase 6.2 (Production, Single File)
+# ================================================
+import os, sqlite3, bcrypt, random
+from datetime import datetime, date, time as dtime, timedelta
 import streamlit as st
-import sqlite3
-from datetime import datetime, date, time
-import hashlib
-import pandas as pd
-import random
-import re
+import plotly.express as px
+import plotly.graph_objects as go
 
-DB_FILE = "timesculpt.db"
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
-# ---------- DB SCHEMA AUTO-PATCH ----------
-def ensure_schema():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+# ---------------------------
+# Theme / Global Page Config
+# ---------------------------
+st.set_page_config(page_title="TimeSculpt", layout="wide")
+THEME_BG = "#0B0E14"
+THEME_PANEL = "#121826"
+THEME_TEXT = "#EDEDED"   # off-white
+THEME_MUTED = "#C8CCD6"  # lighter gray labels
+THEME_GOLD = "#FFD166"   # accents
+THEME_EMPH = "#A5D6FF"   # cool accent
 
-    # Profiles
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            pin_hash TEXT,
-            ai_toggle INTEGER DEFAULT 0,
-            api_key TEXT
+CSS = f"""
+<style>
+/* Base */
+body, .stApp {{ background: {THEME_BG}; color: {THEME_TEXT}; }}
+.block-container {{ padding-top: 2rem; }}
+/* Tabs: ensure always visible */
+[role="tablist"] {{
+  display: flex !important;
+  border-bottom: 2px solid #2A3244;
+  margin-bottom: 1rem;
+}}
+[role="tablist"] [role="tab"] {{
+  color: {THEME_TEXT}; font-weight: 700; padding: 0.5rem 1rem;
+}}
+[role="tablist"] [role="tab"][aria-selected="true"] {{
+  border-bottom: 3px solid {THEME_GOLD};
+  color: {THEME_GOLD};
+}}
+/* Inputs, buttons, narration, etc. keep same styles */
+label, .stMarkdown p {{ color: {THEME_MUTED} !important; font-weight: 600; }}
+.stTextInput > div > div input, .stTextArea textarea, .stNumberInput input,
+.stDateInput input, .stTimeInput input {{
+  color: {THEME_TEXT} !important; background: {THEME_PANEL} !important; border-radius: 10px;
+  border: 1px solid #2A3244;
+}}
+.stButton > button {{
+  background: linear-gradient(45deg, {THEME_GOLD}, #E8B85B);
+  color: #121212; font-weight: 800; border: none; border-radius: 12px; padding: 0.5rem 1rem;
+}}
+.narration-box {{
+  border: 2px solid {THEME_GOLD}; border-radius: 12px; padding: 12px; margin: 8px 0;
+  background: rgba(255, 209, 102, 0.08); color: {THEME_TEXT};
+  font-style: italic;
+}}
+</style>
+"""
+
+st.markdown(CSS, unsafe_allow_html=True)
+
+# ---------------------------
+# DB helpers + schema guard
+# ---------------------------
+DB_PATH = "timesculpt.db"
+
+def conn():
+    return sqlite3.connect(DB_PATH)
+
+def fetch(q, args=()):
+    c = conn(); cur = c.cursor()
+    cur.execute(q, args)
+    rows = cur.fetchall()
+    c.close()
+    return rows
+
+def save(q, args=()):
+    c = conn(); cur = c.cursor()
+    cur.execute(q, args)
+    c.commit(); c.close()
+
+def init_db():
+    c = conn(); cur = c.cursor()
+
+    # profiles
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS profiles(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        pin_hash TEXT,
+        ai_toggle INTEGER DEFAULT 0,
+        api_key TEXT,
+        model TEXT,
+        thresholds TEXT,
+        demo_enabled INTEGER DEFAULT 0
+    )""")
+
+    # future_self
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS future_self(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        profile_id INTEGER,
+        title TEXT,
+        traits TEXT,
+        rituals TEXT,
+        letter TEXT,
+        created_at TEXT
+    )""")
+    try: cur.execute("ALTER TABLE future_self ADD COLUMN letter TEXT")
+    except sqlite3.OperationalError: pass
+    try: cur.execute("ALTER TABLE future_self ADD COLUMN created_at TEXT")
+    except sqlite3.OperationalError: pass
+
+    # goals
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS goals(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        profile_id INTEGER,
+        name TEXT,
+        target REAL,
+        unit TEXT,
+        deadline TEXT,
+        priority INTEGER,
+        loop_tags TEXT,
+        created_at TEXT
+    )""")
+    for col in ("loop_tags", "created_at"):
+        try: cur.execute(f"ALTER TABLE goals ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError: pass
+
+    # loops
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS loops(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        profile_id INTEGER,
+        category TEXT,
+        value REAL,
+        unit TEXT,
+        timestamp TEXT
+    )""")
+    for col in ("unit", "timestamp"):
+        try: cur.execute(f"ALTER TABLE loops ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError: pass
+
+    # interventions
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS interventions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        profile_id INTEGER,
+        goal_id INTEGER,
+        description TEXT,
+        status TEXT,
+        helpful INTEGER,
+        reflection TEXT,
+        created_at TEXT,
+        completed_at TEXT
+    )""")
+    for col in ("helpful","reflection","created_at","completed_at"):
+        try: cur.execute(f"ALTER TABLE interventions ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError: pass
+
+    # lens
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS lens(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        profile_id INTEGER,
+        passage TEXT,
+        category TEXT,
+        collection TEXT,
+        active INTEGER DEFAULT 1,
+        created_at TEXT
+    )""")
+    for col in ("collection","active","created_at"):
+        try: cur.execute(f"ALTER TABLE lens ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError: pass
+    # normalize active to int if text
+    try: cur.execute("UPDATE lens SET active = 1 WHERE active IS NULL")
+    except: pass
+
+    c.commit(); c.close()
+
+init_db()
+
+# ---------------------------
+# Session & small utilities
+# ---------------------------
+if "profile_id" not in st.session_state: st.session_state.profile_id = None
+def current_profile(): return st.session_state.profile_id
+
+def ai_enabled(pid):
+    row = fetch("SELECT ai_toggle FROM profiles WHERE id=?", (pid,))
+    return bool(row and str(row[0][0]) == "1")
+
+def get_threshold(pid, default=40):
+    row = fetch("SELECT thresholds FROM profiles WHERE id=?", (pid,))
+    try:
+        return int(row[0][0]) if row and row[0][0] is not None else default
+    except: return default
+
+def get_demo_flag(pid):
+    row = fetch("SELECT demo_enabled FROM profiles WHERE id=?", (pid,))
+    return bool(row and str(row[0][0]) == "1")
+
+def get_api_key_and_model(pid):
+    row = fetch("SELECT api_key, model FROM profiles WHERE id=?", (pid,))
+    if row:
+        api = row[0][0]
+        model = row[0][1] if row[0][1] else "gpt-4o-mini"
+        return api, model
+    return None, "gpt-4o-mini"
+
+def ai_narration(pid, prompt):
+    api_key, model = get_api_key_and_model(pid)
+    if not (pid and ai_enabled(pid) and api_key and OpenAI):
+        return None
+    try:
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role":"system","content":"You are TimeSculpt, a crisp, empowering, grounded coach. Be concise, warm, and concrete."},
+                {"role":"user","content": prompt}
+            ],
+            max_tokens=160, temperature=0.7
         )
-    """)
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return None
 
+def lens_line(pid, categories=None):
+    # prefer active passages; then any
+    if categories:
+        cat_q = ",".join("?" for _ in categories)
+        rows = fetch(f"SELECT passage FROM lens WHERE profile_id=? AND (active='1' OR active=1) AND LOWER(category) IN ({cat_q}) ORDER BY RANDOM() LIMIT 1",
+                     tuple([pid] + [c.lower() for c in categories]))
+        if rows: return rows[0][0]
+    rows = fetch("SELECT passage FROM lens WHERE profile_id=? AND (active='1' OR active=1) ORDER BY RANDOM() LIMIT 1", (pid,))
+    if rows: return rows[0][0]
+    rows = fetch("SELECT passage FROM lens WHERE profile_id=? ORDER BY RANDOM() LIMIT 1", (pid,))
+    return rows[0][0] if rows else ""
+
+# ---------------------------
+# Demo seeding (1 month)
+# ---------------------------
+def seed_demo():
+    # if DemoUser exists, skip
+    demo = fetch("SELECT id FROM profiles WHERE name=?", ("DemoUser",))
+    if demo: return
+    h = bcrypt.hashpw("demo".encode(), bcrypt.gensalt()).decode()
+    save("INSERT INTO profiles(name,pin_hash,ai_toggle,model,thresholds,demo_enabled) VALUES (?,?,?,?,?,?)",
+         ("DemoUser", h, 0, "gpt-4o-mini", "40", 1))
+    pid = fetch("SELECT id FROM profiles WHERE name=?", ("DemoUser",))[0][0]
     # Future Self
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS future_self (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            profile_id INTEGER,
-            trait TEXT,
-            letter TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Goals
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS goals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            profile_id INTEGER,
-            name TEXT,
-            unit TEXT,
-            target REAL,
-            deadline TEXT,
-            priority INTEGER,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    c.execute("PRAGMA table_info(goals)")
-    cols = [row[1] for row in c.fetchall()]
-    if "created_at" not in cols:
-        c.execute("ALTER TABLE goals ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP")
-
-    # Loops
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS loops (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            profile_id INTEGER,
-            name TEXT,
-            value REAL,
-            unit TEXT,
-            timestamp TEXT
-        )
-    """)
-
+    save("""INSERT INTO future_self(profile_id,title,traits,rituals,letter,created_at)
+            VALUES(?,?,?,?,?,?)""",
+         (pid, "The Disciplined Architect",
+          "Focused, Patient, Resilient",
+          "Morning writing, Evening walk",
+          "Stay the course. You already are the one who finishes.",
+          datetime.now().isoformat()))
+    # Goals with loop tags mapping
+    goals = [
+        ("Finish Book", 10000, "words", (date.today()+timedelta(days=30)).isoformat(), 5, "writing,planning"),
+        ("Lose Weight", 2, "kg",      (date.today()+timedelta(days=30)).isoformat(), 4, "exercise,walk,sleep_good,water"),
+        ("Save Money", 500, "£",       (date.today()+timedelta(days=30)).isoformat(), 3, "save_invest,budget_check")
+    ]
+    for name, target, unit, dl, pr, tags in goals:
+        save("""INSERT INTO goals(profile_id,name,target,unit,deadline,priority,loop_tags,created_at)
+                VALUES(?,?,?,?,?,?,?,?)""",
+             (pid, name, target, unit, dl, pr, tags, datetime.now().isoformat()))
+    # Loops 30 days
+    loop_pool = [
+        ("writing","mins"), ("planning","mins"), ("exercise","sessions"),
+        ("walk","mins"), ("sleep_good","hrs"), ("water","glasses"),
+        ("save_invest","£"), ("budget_check","count"),
+        ("scroll","mins"), ("late_sleep","hrs"), ("junk_food","units")
+    ]
+    for i in range(30):
+        ts_day = datetime.now() - timedelta(days=i)
+        for cat,u in loop_pool:
+            val = max(0, int(random.gauss(3, 2)))
+            if random.random()<0.2: val=0
+            save("INSERT INTO loops(profile_id,category,value,unit,timestamp) VALUES(?,?,?,?,?)",
+                 (pid, cat, float(val), u, (ts_day - timedelta(minutes=random.randint(0,120))).isoformat()))
     # Lens
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS lens_lines (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            profile_id INTEGER,
-            collection TEXT,
-            category TEXT,
-            passage TEXT,
-            used INTEGER DEFAULT 0
-        )
-    """)
-    c.execute("PRAGMA table_info(lens_lines)")
-    cols = [row[1] for row in c.fetchall()]
-    if "collection" not in cols:
-        c.execute("ALTER TABLE lens_lines ADD COLUMN collection TEXT DEFAULT 'default'")
+    passages = [
+        ("Small steps carve the stone.", "Recursion", "core"),
+        ("Late nights erode clarity.", "Collapse", "core"),
+        ("Momentum grows in silence.", "Emergence", "core"),
+        ("Attention is the chisel of identity.", "Recursion", "core"),
+        ("Guard the morning; it guards your future.", "Emergence", "core")
+    ]
+    for p,cat,col in passages:
+        save("INSERT INTO lens(profile_id,passage,category,collection,active,created_at) VALUES(?,?,?,?,?,?)",
+             (pid, p, cat, col, 1, datetime.now().isoformat()))
+    # Interventions
+    gi = fetch("SELECT id,name FROM goals WHERE profile_id=?", (pid,))
+    gmap = {n:i for (i,n) in gi}
+    def giid(name): return gmap.get(name, None)
+    rows = [
+        (giid("Finish Book"), "7-minute writing starter"),
+        (giid("Lose Weight"), "15-minute walk after lunch"),
+        (giid("Save Money"),  "Pay-yourself-first 10%")
+    ]
+    for gid,desc in rows:
+        if gid:
+            save("""INSERT INTO interventions(profile_id,goal_id,description,status,helpful,created_at)
+                    VALUES(?,?,?,?,?,?)""",
+                 (pid, gid, desc, "completed", 1, datetime.now().isoformat()))
 
-    conn.commit()
-    conn.close()
+# ---------------------------
+# Tabs
+# ---------------------------
+tabs = st.tabs([
+    "📖 Guide","👤 Profiles","🌠 Future Self","🎯 Goals","🔄 Loops",
+    "📈 Forecast","🛠 Interventions","⚖️ Diagnostics","📚 Lens","⚙️ Settings"
+])
 
-ensure_schema()
-
-# ---------- HELPERS ----------
-def sha256(s): return hashlib.sha256(s.encode()).hexdigest()
-def get_conn(): return sqlite3.connect(DB_FILE)
-def now_iso(): return datetime.now().isoformat(timespec="seconds")
-
-def get_lens_lines(pid, n=1):
-    conn = get_conn(); cur = conn.cursor()
-    rows = cur.execute("SELECT id,passage FROM lens_lines WHERE profile_id=? AND used=0 LIMIT ?",(pid,n)).fetchall()
-    if not rows:  # reset if all used
-        cur.execute("UPDATE lens_lines SET used=0 WHERE profile_id=?",(pid,))
-        conn.commit()
-        rows = cur.execute("SELECT id,passage FROM lens_lines WHERE profile_id=? LIMIT ?",(pid,n)).fetchall()
-    lines = []
-    for rid,p in rows:
-        lines.append(p)
-        cur.execute("UPDATE lens_lines SET used=1 WHERE id=?",(rid,))
-    conn.commit(); conn.close()
-    return lines
-
-# ---------- THEME ----------
-st.set_page_config(page_title="TimeSculpt", page_icon="⏳", layout="wide")
-
-if "ts_theme" not in st.session_state:
-    st.session_state.ts_theme = "Cosmic Night"
-
-COSMIC_NIGHT = """
-:root{
-  --bg0:#0b1020; --bg1:#0e1630; --bg2:#12204a; --card:#0f1a33;
-  --ink:#eaeaf2; --ink-dim:#cfd3de; --muted:#9aa7bd; --accent:#ffd54a;
-  --accent-2:#ffb300; --ring:#394b70; --input:#141e36; --border:#2a3860;
-}
-html,body,[data-testid="stAppViewContainer"]{
-  background: radial-gradient(1200px 1200px at 20% 10%, var(--bg2) 0%, var(--bg1) 35%, var(--bg0) 100%) !important;
-  color: var(--ink); font-size:18px;
-}
-h1,h2,h3{ color: var(--accent) !important; font-weight:800 !important; }
-.stTextInput input, .stNumberInput input, .stDateInput input, .stTextArea textarea{
-  color: var(--ink) !important; background: var(--input) !important;
-}
-"""
-
-AURORA_LIGHT = """
-:root{
-  --bg:#f6f7fb; --ink:#0f172a; --muted:#64748b; --accent:#f59e0b;
-  --card:#ffffff; --border:#e5e7eb; --input:#ffffff;
-}
-html,body,[data-testid="stAppViewContainer"]{
-  background: var(--bg) !important; color: var(--ink); font-size:18px;
-}
-h1,h2,h3{ color: var(--accent) !important; font-weight:800 !important; }
-.stTextInput input, .stNumberInput input, .stDateInput input, .stTextArea textarea{
-  color: var(--ink) !important; background: var(--input) !important;
-}
-"""
-
-def apply_theme(theme):
-    css = COSMIC_NIGHT if theme=="Cosmic Night" else AURORA_LIGHT
-    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
-
-apply_theme(st.session_state.ts_theme)
-
-# ---------- APP STATE ----------
-if "profile_id" not in st.session_state: st.session_state.profile_id=None
-if "profile_name" not in st.session_state: st.session_state.profile_name=None
-
-# ---------- NAV ----------
-tabs=["📘 Guide","👤 Profiles","🌠 Future Self","🎯 Goals","🔄 Input (Loops)",
-      "📈 Forecast","🛠️ Interventions","⚖️ Diagnostics","📚 Lens","⚙️ Settings"]
-choice=st.sidebar.radio("Navigate",tabs)
-
-# ---------- GUIDE ----------
-if choice=="📘 Guide":
-    st.title("⏳ TimeSculpt – Instructional Guide")
+# ---------------------------
+# GUIDE
+# ---------------------------
+with tabs[0]:
+    st.title("TimeSculpt — Quick Start & Deep Guide")
     st.markdown("""
-    TimeSculpt is not a habit tracker. It is a **recursive identity system**. 
-    Each loop you log, each goal you set, and each choice you take bends probability toward the self you choose.
-    """)
-    st.subheader("Roadmap")
+**What TimeSculpt is:** a multi-goal, identity-first system that converts small daily loops into progress forecasts,
+interventions that actually help, and narrative guidance in your voice (via Lens or AI).
+""")
+    st.markdown("---")
+    st.subheader("Daily Flow")
     st.markdown("""
-    - 👤 Profiles → Create and log into your identity  
-    - 🌠 Future Self → Define traits, rituals, and letters  
-    - 🎯 Goals → Attach measurable targets  
-    - 🔄 Input (Loops) → Log daily actions  
-    - 📈 Forecast → See probabilities, ETAs, and narrative  
-    - 🛠️ Interventions → Get nudges for next steps  
-    - ⚖️ Diagnostics → Forces and drags shaping progress  
-    - 📚 Lens → Upload texts to enrich narration  
-    - ⚙️ Settings → Control AI toggle, API key, and Theme  
-    """)
-    st.subheader("Step by Step")
+1. **Log Loops** (🔄): capture writing/exercise/save/etc. with date+time.  
+2. **Check Forecast** (📈): see % to hit each goal + smallest next move.  
+3. **Accept & Complete an Intervention** (🛠): then record if it helped.  
+4. **Let Letters Resurface** (🌠→📈): if alignment dips, your Future Self nudges you.  
+""")
+    st.subheader("Weekly Flow")
     st.markdown("""
-    1. Create a profile (name + PIN).  
-    2. Define traits + letters in 🌠 Future Self.  
-    3. Add measurable 🎯 Goals.  
-    4. Log 🔄 Loops daily with value + timestamp.  
-    5. 📈 Forecast shows probabilities, ETA, narration.  
-    6. 🛠️ Interventions suggest smallest next moves.  
-    7. ⚖️ Diagnostics show Forces vs Drags.  
-    8. 📚 Lens enriches narration with your texts.  
-    9. ⚙️ Settings lets you manage AI + Theme.  
-    """)
-    st.subheader("Theme Toggle")
-    st.markdown("Default is 🌌 Cosmic Night. Switch to 🌅 Aurora Light in ⚙️ Settings.")
+- **Diagnostics** (⚖️): review **Forces vs Drags** and the **balance ratio**.  
+- **Refit goals** (🎯): adjust targets/loop tags if needed.  
+- **Refresh Lens** (📚): add passages; keep narration alive.  
+""")
+    st.subheader("Tabs Overview")
+    st.markdown("""
+- **👤 Profiles**: create/select/delete.  
+- **🌠 Future Self**: title, traits, rituals, letter (resurfaces when forecasts dip).  
+- **🎯 Goals**: target/unit/deadline/priority + **loop tags** to map which loops count.  
+- **🔄 Loops**: category/value/unit + date/time.  
+- **📈 Forecast**: gauge + 30-day trend + narration (AI or Lens).  
+- **🛠 Interventions**: offer → accept → complete; reflect & mark helpful.  
+- **⚖️ Diagnostics**: expanded forces/drags/neutral, ratio metric, narration.  
+- **📚 Lens**: passages (category/collection) with **active** toggle.  
+- **⚙️ Settings**: AI toggle, API key, model (GPT-4o-mini/4o/4-turbo), threshold, demo toggle.  
+""")
+    if not current_profile():
+        st.info("ℹ️ No profile is active. Create one in **Profiles**, or enable **Demo Data** in **Settings** to preload a sample.")
 
-# ---------- PROFILES ----------
-elif choice=="👤 Profiles":
-    st.header("Profiles")
-    conn=get_conn();cur=conn.cursor()
-    with st.form("new_profile"):
-        name=st.text_input("Profile Name")
-        pin=st.text_input("PIN",type="password")
-        if st.form_submit_button("Create"):
-            if name and pin:
-                cur.execute("INSERT INTO profiles (name,pin_hash) VALUES (?,?)",(name,sha256(pin)))
-                conn.commit(); st.success("Profile created.")
-    profiles=cur.execute("SELECT id,name FROM profiles").fetchall(); conn.close()
-    if profiles:
-        names=[p[1] for p in profiles]
-        pick=st.selectbox("Select Profile",names)
-        pin=st.text_input("PIN to Login",type="password")
-        if st.button("Login"):
-            conn=get_conn();cur=conn.cursor()
-            cur.execute("SELECT id,pin_hash FROM profiles WHERE name=?",(pick,))
-            row=cur.fetchone(); conn.close()
-            if row and row[1]==sha256(pin):
-                st.session_state.profile_id=row[0]; st.session_state.profile_name=pick
-                st.success(f"Logged in as {pick}")
+# ---------------------------
+# PROFILES
+# ---------------------------
+with tabs[1]:
+    st.subheader("Profiles")
+    colL, colR = st.columns([2,1])
+    with colL:
+        name = st.text_input("Profile Name")
+        pin = st.text_input("PIN (4+ digits)", type="password")
+        if st.button("Create Profile"):
+            if not name or not pin:
+                st.warning("Name and PIN required.")
+            else:
+                h = bcrypt.hashpw(pin.encode(), bcrypt.gensalt()).decode()
+                save("INSERT INTO profiles(name,pin_hash,ai_toggle,model,thresholds,demo_enabled) VALUES(?,?,?,?,?,?)",
+                     (name, h, 0, "gpt-4o-mini", "40", 0))
+                st.success(f"Profile '{name}' created.")
+    with colR:
+        profs = fetch("SELECT id,name FROM profiles ORDER BY id DESC")
+        if profs:
+            choice = st.selectbox("Select Profile", profs, format_func=lambda r: r[1])
+            if st.button("Login"):
+                st.session_state.profile_id = choice[0]
+                st.success(f"Active profile: {choice[1]}")
+            if st.button("Delete Selected"):
+                save("DELETE FROM profiles WHERE id=?", (choice[0],))
+                st.session_state.profile_id = None
+                st.success("Profile deleted.")
+        else:
+            st.caption("No profiles yet.")
 
-# ---------- FUTURE SELF ----------
-elif choice=="🌠 Future Self":
-    st.header("Future Self")
-    pid=st.session_state.profile_id
-    if not pid: st.info("Log in first.")
+# ---------------------------
+# FUTURE SELF
+# ---------------------------
+with tabs[2]:
+    st.subheader("Future Self")
+    pid = current_profile()
+    if not pid:
+        st.info("Select a profile.")
     else:
-        conn=get_conn();cur=conn.cursor()
-        trait=st.text_input("Add Trait")
-        if st.button("Save Trait"): cur.execute("INSERT INTO future_self (profile_id,trait) VALUES (?,?)",(pid,trait)); conn.commit()
-        letter=st.text_area("Future Self Letter")
-        if st.button("Save Letter"): cur.execute("INSERT INTO future_self (profile_id,letter) VALUES (?,?)",(pid,letter)); conn.commit()
-        rows=cur.execute("SELECT trait,letter,created_at FROM future_self WHERE profile_id=?",(pid,)).fetchall()
-        for t,l,c in rows[-5:]: st.markdown(f"- **{t or ''}** {l or ''} ({c})")
-        conn.close()
+        with st.form("fs_form"):
+            t = st.text_input("Title")
+            traits = st.text_area("Traits (comma separated)")
+            rituals = st.text_area("Rituals (comma separated)")
+            letter = st.text_area("Letter from Future Self")
+            if st.form_submit_button("Save Future Self"):
+                save("""INSERT INTO future_self(profile_id,title,traits,rituals,letter,created_at)
+                        VALUES(?,?,?,?,?,?)""",
+                     (pid, t, traits, rituals, letter, datetime.now().isoformat()))
+                st.success("Saved.")
+        fs = fetch("""SELECT title,traits,rituals,letter,created_at
+                      FROM future_self WHERE profile_id=? ORDER BY id DESC LIMIT 1""",(pid,))
+        if fs:
+            t, tr, r, l, ca = fs[0]
+            st.markdown(f"**Title:** {t or '—'}")
+            st.markdown(f"**Traits:** {tr or '—'}")
+            st.markdown(f"**Rituals:** {r or '—'}")
+            st.markdown("**Letter:**")
+            st.markdown(f"<div class='narration-box'>{(l or '').strip()}</div>", unsafe_allow_html=True)
+            st.caption(f"Created: {ca}")
 
-# ---------- GOALS ----------
-elif choice=="🎯 Goals":
-    st.header("Goals")
-    pid=st.session_state.profile_id
-    if not pid: st.info("Log in first.")
+# ---------------------------
+# GOALS
+# ---------------------------
+with tabs[3]:
+    st.subheader("Goals")
+    pid = current_profile()
+    if not pid:
+        st.info("Select a profile.")
     else:
-        with st.form("add_goal"):
-            gname=st.text_input("Goal Name")
-            unit=st.text_input("Unit")
-            target=st.number_input("Target",min_value=0.0)
-            deadline=st.date_input("Deadline")
-            priority=st.slider("Priority",1,5,3)
+        with st.form("goal_form"):
+            gname = st.text_input("Goal Name")
+            unit = st.text_input("Unit (e.g., words, kg, £, mins)")
+            target = st.number_input("Target", min_value=0.0, step=1.0)
+            deadline = st.date_input("Deadline", value=date.today()+timedelta(days=30))
+            priority = st.slider("Priority (1 low → 5 high)", 1, 5, 3)
+            loop_tags = st.text_input("Loop Tags (comma separated, e.g., writing,planning)")
             if st.form_submit_button("Save Goal"):
-                conn=get_conn();cur=conn.cursor()
-                cur.execute("INSERT INTO goals (profile_id,name,unit,target,deadline,priority) VALUES (?,?,?,?,?,?)",
-                            (pid,gname,unit,target,str(deadline),priority))
-                conn.commit(); conn.close()
-        conn=get_conn();cur=conn.cursor()
-        rows=cur.execute("SELECT name,unit,target,deadline,priority FROM goals WHERE profile_id=?",(pid,)).fetchall()
-        conn.close()
-        for n,u,t,d,p in rows: st.markdown(f"- **{n}** ({t} {u}) by {d} (priority {p})")
+                save("""INSERT INTO goals(profile_id,name,target,unit,deadline,priority,loop_tags,created_at)
+                        VALUES(?,?,?,?,?,?,?,?)""",
+                     (pid, gname, target, unit, str(deadline), priority, loop_tags, datetime.now().isoformat()))
+                st.success("Goal saved.")
+        gl = fetch("""SELECT id,name,target,unit,deadline,priority,loop_tags
+                      FROM goals WHERE profile_id=? ORDER BY id DESC""",(pid,))
+        if gl:
+            st.markdown("### Current Goals")
+            for gid, gn, tar, u, dl, pr, tags in gl:
+                st.markdown(f"- **{gn}** → {tar} {u} by {dl} · Priority {pr} · Tags: `{tags or '—'}`")
 
-# ---------- LOOPS ----------
-elif choice=="🔄 Input (Loops)":
-    st.header("Log Loops")
-    pid=st.session_state.profile_id
-    if not pid: st.info("Log in first.")
+# ---------------------------
+# LOOPS
+# ---------------------------
+with tabs[4]:
+    st.subheader("Loops")
+    pid = current_profile()
+    if not pid:
+        st.info("Select a profile.")
     else:
-        with st.form("log_loop"):
-            lname=st.text_input("Loop Name")
-            val=st.number_input("Value",min_value=0.0)
-            unit=st.text_input("Unit")
-            ts_date=st.date_input("Date",value=date.today())
-            ts_time=st.time_input("Time",value=datetime.now().time())
-            ts=datetime.combine(ts_date,ts_time).isoformat()
-            if st.form_submit_button("Log"):
-                conn=get_conn();cur=conn.cursor()
-                cur.execute("INSERT INTO loops (profile_id,name,value,unit,timestamp) VALUES (?,?,?,?,?)",
-                            (pid,lname,val,unit,ts))
-                conn.commit(); conn.close(); st.success("Loop logged.")
+        with st.form("loop_form"):
+            lcat = st.text_input("Category (e.g., writing, exercise, save_invest, scroll)")
+            lval = st.number_input("Value", min_value=0.0, step=1.0)
+            lunit = st.text_input("Unit (mins, £, sessions, etc.)")
+            ldate = st.date_input("Date", value=date.today())
+            ltime = st.time_input("Time", value=(datetime.now().time()))
+            if st.form_submit_button("Log Loop"):
+                ts = datetime.combine(ldate, ltime).isoformat()
+                save("INSERT INTO loops(profile_id,category,value,unit,timestamp) VALUES(?,?,?,?,?)",
+                     (pid, lcat, lval, lunit, ts))
+                st.success("Loop logged.")
+        recent = fetch("""SELECT category,value,unit,timestamp
+                          FROM loops WHERE profile_id=? ORDER BY id DESC LIMIT 12""",(pid,))
+        if recent:
+            st.markdown("### Recent")
+            for c, v, u, ts in recent:
+                st.markdown(f"- **{c}** → {v:g} {u or ''} · {ts}")
 
-# ---------- FORECAST ----------
-elif choice=="📈 Forecast":
-    st.header("Forecast")
-    pid=st.session_state.profile_id
-    if not pid: st.info("Log in first.")
+# ---------------------------
+# FORECAST
+# ---------------------------
+with tabs[5]:
+    st.subheader("Forecast")
+    pid = current_profile()
+    if not pid:
+        st.info("Select a profile.")
     else:
-        conn=get_conn();cur=conn.cursor()
-        goals=cur.execute("SELECT id,name,unit,target,deadline FROM goals WHERE profile_id=?",(pid,)).fetchall()
-        loops=pd.read_sql_query("SELECT * FROM loops WHERE profile_id=?",(conn,),params=(pid,))
-        conn.close()
-        if goals:
-            for gid,gname,gunit,gtarget,gdeadline in goals:
-                df=loops[loops["unit"]==gunit]
-                prog=df["value"].sum() if not df.empty else 0
-                pace=df.groupby("timestamp")["value"].sum().mean() if not df.empty else 0
-                prob=min(prog/gtarget,1) if gtarget>0 else 0
-                eta=(gtarget-prog)/pace if pace>0 else float("inf")
-                lens=get_lens_lines(pid,1)
-                lens_text=f" — {lens[0]}" if lens else ""
-                st.subheader(gname)
-                st.metric("Success Chance",f"{prob*100:.1f}%")
-                st.metric("ETA (days)","∞" if eta==float("inf") else f"{eta:.1f}")
-                st.caption(f"Forecast narrative{lens_text}")
-            if not loops.empty:
-                loops["timestamp"]=pd.to_datetime(loops["timestamp"]); loops["day"]=loops["timestamp"].dt.date
-                fig=px.line(loops.groupby("day")["value"].sum().reset_index(),x="day",y="value",title="Daily Loop Totals")
-                st.plotly_chart(fig,use_container_width=True)
-
-# ---------- INTERVENTIONS ----------
-elif choice=="🛠️ Interventions":
-    st.header("Interventions")
-    pid=st.session_state.profile_id
-    if not pid: st.info("Log in first.")
-    else:
-        conn=get_conn();cur=conn.cursor()
-        goals=cur.execute("SELECT name,unit,target FROM goals WHERE profile_id=?",(pid,)).fetchall()
-        loops=pd.read_sql_query("SELECT * FROM loops WHERE profile_id=?",(conn,),params=(pid,))
-        conn.close()
-        if not goals: st.info("No goals yet.")
+        goals = fetch("""SELECT id,name,target,unit,deadline,priority,loop_tags
+                         FROM goals WHERE profile_id=? ORDER BY priority DESC, id ASC""",(pid,))
+        if not goals:
+            st.info("Add a goal in the Goals tab.")
         else:
-            st.subheader("Top Interventions")
-            for gname,gunit,gtarget in goals:
-                df=loops[loops["unit"]==gunit]
-                prog=df["value"].sum() if not df.empty else 0
-                gap=gtarget-prog
-                if gap>0:
-                    move=min(gap,random.randint(1,5))
-                    lens=get_lens_lines(pid,1)
-                    st.write(f"- {move} {gunit} toward **{gname}** {('→ '+lens[0]) if lens else ''}")
+            threshold = get_threshold(pid, 40)
+            for gid, gn, tar, u, dl, pr, tags in goals:
+                tagset = [t.strip().lower() for t in (tags or "").split(",") if t.strip()]
+                if tagset:
+                    qs = ",".join("?"*len(tagset))
+                    loops = fetch(f"""SELECT value, timestamp FROM loops
+                                      WHERE profile_id=? AND LOWER(category) IN ({qs})
+                                      ORDER BY timestamp ASC""", tuple([pid]+tagset))
+                else:
+                    # fallback: try matching goal name
+                    loops = fetch("""SELECT value, timestamp FROM loops
+                                     WHERE profile_id=? AND LOWER(category) LIKE ?
+                                     ORDER BY timestamp ASC""", (pid, f"%{gn.lower()}%"))
+                prog = sum(float(v or 0) for v,_ in loops) if loops else 0.0
+                pct = max(0.0, min(100.0, (prog/float(tar))*100.0 if tar else 0.0))
 
-# ---------- DIAGNOSTICS ----------
-elif choice=="⚖️ Diagnostics":
-    st.header("Diagnostics")
-    pid=st.session_state.profile_id
-    if not pid: st.info("Log in first.")
+                st.markdown(f"#### {gn}")
+                colA,colB = st.columns([1,2])
+                with colA:
+                    st.metric("Progress", f"{pct:.1f}%")
+                    gauge = go.Figure(go.Indicator(
+                        mode="gauge+number",
+                        value=pct,
+                        title={"text": f"{gn}"},
+                        gauge={'axis': {'range': [0,100]}, 'bar': {'color': THEME_GOLD}}
+                    ))
+                    st.plotly_chart(gauge, use_container_width=True, key=f"g-{gid}")
+                with colB:
+                    # build 30-day daily % trend (synthetic from cumulative loops)
+                    today = date.today()
+                    days = [today - timedelta(days=i) for i in range(29,-1,-1)]
+                    # sum per day
+                    per_day = {d.isoformat():0.0 for d in days}
+                    for v, ts in loops:
+                        dkey = datetime.fromisoformat(ts).date().isoformat()
+                        if dkey in per_day: per_day[dkey] += float(v)
+                    cum=0.0; trend=[]
+                    for d in days:
+                        cum += per_day[d.isoformat()]
+                        trend.append( (cum/float(tar))*100.0 if tar else 0.0 )
+                    line = px.line(x=days, y=[max(0,min(100,t)) for t in trend],
+                                   labels={'x':'Date','y':'Success %'},
+                                   title=f"{gn} — 30-day Trend")
+                    st.plotly_chart(line, use_container_width=True, key=f"t-{gid}")
+
+                base = f"Goal: {gn}. Progress {prog:g}/{tar:g} {u}. Deadline {dl}. Priority {pr}."
+                ll = lens_line(pid, categories=["Recursion","Emergence","Neutral"])
+                text = ai_narration(pid, base + (" " + ll if ll else "")) or (base + (" " + ll if ll else ""))
+                st.markdown(f"<div class='narration-box'>{text}</div>", unsafe_allow_html=True)
+
+                if pct < float(threshold or 40):
+                    lf = fetch("""SELECT letter FROM future_self
+                                  WHERE profile_id=? ORDER BY id DESC LIMIT 1""",(pid,))
+                    if lf and lf[0][0]:
+                        st.warning("📜 Future Self Letter resurfaces:")
+                        st.markdown(f"<div class='narration-box'>{lf[0][0]}</div>", unsafe_allow_html=True)
+
+# ---------------------------
+# INTERVENTIONS
+# ---------------------------
+with tabs[6]:
+    st.subheader("Interventions")
+    pid = current_profile()
+    if not pid:
+        st.info("Select a profile.")
     else:
-        loops=pd.read_sql_query("SELECT * FROM loops WHERE profile_id=?",(get_conn(),),params=(pid,))
-        if loops.empty: st.info("No loops yet.")
+        gl = fetch("SELECT id,name FROM goals WHERE profile_id=? ORDER BY id DESC", (pid,))
+        gmap = {n:i for (i,n) in gl}
+        goal_sel = st.selectbox("Attach to Goal", ["—"] + [n for n in gmap.keys()])
+        with st.form("int_form"):
+            desc = st.text_input("Intervention Description")
+            if st.form_submit_button("Offer / Add"):
+                if goal_sel != "—" and desc.strip():
+                    save("""INSERT INTO interventions(profile_id,goal_id,description,status,created_at)
+                            VALUES(?,?,?,?,?)""",(pid, gmap[goal_sel], desc.strip(), "offered", datetime.now().isoformat()))
+                    st.success("Intervention added.")
+        ints = fetch("""SELECT id,goal_id,description,status,helpful,reflection,created_at,completed_at
+                        FROM interventions WHERE profile_id=? ORDER BY id DESC LIMIT 20""",(pid,))
+        if ints:
+            for iid, gid, dsc, stt, hlp, refl, ca, comp in ints:
+                st.markdown(f"**{dsc}** — *{stt}*")
+                c1,c2,c3,c4 = st.columns([1,1,1,3])
+                if stt == "offered":
+                    if c1.button("Accept", key=f"a{iid}"):
+                        save("UPDATE interventions SET status=? WHERE id=?", ("accepted", iid)); st.experimental_rerun()
+                    if c2.button("Skip", key=f"s{iid}"):
+                        save("UPDATE interventions SET status=? WHERE id=?", ("skipped", iid)); st.experimental_rerun()
+                if stt in ("accepted","completed"):
+                    if c3.button("Complete", key=f"c{iid}"):
+                        save("UPDATE interventions SET status=?, completed_at=? WHERE id=?", ("completed", datetime.now().isoformat(), iid)); st.experimental_rerun()
+                if stt == "completed":
+                    colh, colr = st.columns([1,3])
+                    helpful_sel = colh.selectbox("Helpful?", ["—","Yes","No"], index=(0 if hlp is None else (1 if str(hlp)=="1" else 2)), key=f"h{iid}")
+                    refl_txt = colr.text_input("Reflection", value=(refl or ""), key=f"r{iid}")
+                    if st.button("Save Feedback", key=f"fb{iid}"):
+                        helpful_val = None
+                        if helpful_sel == "Yes": helpful_val = 1
+                        elif helpful_sel == "No": helpful_val = 0
+                        save("UPDATE interventions SET helpful=?, reflection=? WHERE id=?", (str(helpful_val) if helpful_val is not None else None, refl_txt, iid))
+                        st.success("Feedback saved.")
+
+# ---------------------------
+# DIAGNOSTICS
+# ---------------------------
+with tabs[7]:
+    st.subheader("Diagnostics")
+    pid = current_profile()
+    if not pid:
+        st.info("Select a profile.")
+    else:
+        loops = fetch("SELECT category,value FROM loops WHERE profile_id=?", (pid,))
+        if not loops:
+            st.info("No loops yet.")
         else:
-            loops["timestamp"]=pd.to_datetime(loops["timestamp"])
-            by_loop=loops.groupby("name")["value"].sum().reset_index()
-            by_loop["type"]=by_loop["name"].apply(lambda x:"Drag" if re.search(r"scroll|late|junk",x.lower()) else "Force")
-            forces=by_loop[by_loop["type"]=="Force"]; drags=by_loop[by_loop["type"]=="Drag"]
-            if not forces.empty:
-                st.subheader("Forces")
-                fig=px.bar(forces,x="name",y="value",color="value",title="Positive Drivers")
-                st.plotly_chart(fig,use_container_width=True)
-            if not drags.empty:
-                st.subheader("Drags")
-                fig=px.bar(drags,x="name",y="value",color="value",title="Negative Drags")
-                st.plotly_chart(fig,use_container_width=True)
+            forces, drags, neutral = {}, {}, {}
+            force_keywords = ["write","exercise","save","sleep_good","study","meditate","walk","water","planning","budget_check","save_invest"]
+            drag_keywords  = ["scroll","late_sleep","junk","skip","procrastinate","smoke","drink","junk_food"]
+            for cat,val in loops:
+                c = (cat or "").lower()
+                if any(w in c for w in force_keywords):
+                    forces[cat] = forces.get(cat,0)+float(val or 0)
+                elif any(w in c for w in drag_keywords):
+                    drags[cat] = drags.get(cat,0)+float(val or 0)
+                else:
+                    neutral[cat] = neutral.get(cat,0)+float(val or 0)
+            if forces:
+                st.plotly_chart(px.bar(x=list(forces.keys()), y=list(forces.values()),
+                                       title="Forces (+)", labels={"x":"Loop","y":"Total"}), use_container_width=True)
+            if drags:
+                st.plotly_chart(px.bar(x=list(drags.keys()), y=list(drags.values()),
+                                       title="Drags (−)", labels={"x":"Loop","y":"Total"}), use_container_width=True)
+            tf, td = sum(forces.values()), sum(drags.values())
+            if tf+td>0:
+                ratio = tf/(tf+td)
+                st.metric("Forces/Drags Balance", f"{ratio:.2f}")
+            prompt = f"Diagnostics: Forces={tf:.1f}, Drags={td:.1f}, Ratio={(tf/(tf+td) if tf+td>0 else 0):.2f}. "
+            prompt += "Suggest the smallest corrective move in plain language."
+            narr = ai_narration(pid, prompt) or (lens_line(pid, ["Recursion","Emergence","Collapse","Neutral"]) or "")
+            if narr:
+                st.markdown(f"<div class='narration-box'>{narr}</div>", unsafe_allow_html=True)
 
-# ---------- LENS ----------
-elif choice=="📚 Lens":
-    st.header("Lens")
-    pid=st.session_state.profile_id
-    if not pid: st.info("Log in first.")
+# ---------------------------
+# LENS
+# ---------------------------
+with tabs[8]:
+    st.subheader("Lens")
+    pid = current_profile()
+    if not pid:
+        st.info("Select a profile.")
     else:
-        with st.form("add_lens"):
-            col=st.text_input("Collection")
-            cat=st.selectbox("Category",["Collapse","Recursion","Emergence","Neutral"])
-            txt=st.text_area("Passages (one per line)")
-            if st.form_submit_button("Save"):
-                conn=get_conn();cur=conn.cursor()
-                for line in txt.splitlines():
-                    if line.strip():
-                        cur.execute("INSERT INTO lens_lines (profile_id,collection,category,passage) VALUES (?,?,?,?)",(pid,col,cat,line.strip()))
-                conn.commit(); conn.close(); st.success("Lens saved.")
+        with st.form("lens_form"):
+            psg = st.text_area("Passage")
+            cat = st.selectbox("Category", ["Recursion","Emergence","Collapse","Neutral"])
+            col = st.text_input("Collection (optional)", value="core")
+            act = st.checkbox("Active", value=True)
+            if st.form_submit_button("Add Passage"):
+                save("""INSERT INTO lens(profile_id,passage,category,collection,active,created_at)
+                        VALUES(?,?,?,?,?,?)""",
+                     (pid, psg.strip(), cat, col.strip(), 1 if act else 0, datetime.now().isoformat()))
+                st.success("Passage saved.")
+        # manage
+        rows = fetch("""SELECT id, passage, category, collection, active
+                        FROM lens WHERE profile_id=? ORDER BY id DESC LIMIT 20""",(pid,))
+        if rows:
+            st.markdown("### Recent Passages")
+            for lid, p, c, col, a in rows:
+                colA,colB,colC = st.columns([6,2,2])
+                colA.markdown(f"**{c}** · *{col or '—'}* → {p}")
+                new_state = colB.selectbox("Active?", ["Yes","No"], index=(0 if str(a)=="1" else 1), key=f"act{lid}")
+                if colC.button("Update", key=f"upd{lid}"):
+                    save("UPDATE lens SET active=? WHERE id=?", ("1" if new_state=="Yes" else "0", lid))
+                    st.success("Updated.")
 
-# ---------- SETTINGS ----------
-elif choice=="⚙️ Settings":
-    st.header("Settings")
-    pid=st.session_state.profile_id
-    if not pid: st.info("Log in first.")
+# ---------------------------
+# SETTINGS
+# ---------------------------
+with tabs[9]:
+    st.subheader("Settings")
+    pid = current_profile()
+    if not pid:
+        st.info("Select a profile.")
     else:
-        conn=get_conn();cur=conn.cursor()
-        ai=st.checkbox("Enable AI")
-        key=st.text_input("API Key",type="password")
-        theme=st.radio("Theme",["Cosmic Night","Aurora Light"], index=0 if st.session_state.ts_theme=="Cosmic Night" else 1, horizontal=True)
-        if st.button("Save"):
-            cur.execute("UPDATE profiles SET ai_toggle=?, api_key=? WHERE id=?",(int(ai),key,pid))
-            conn.commit(); st.success("Settings saved.")
-            if theme != st.session_state.ts_theme:
-                st.session_state.ts_theme = theme
-                apply_theme(theme)
-        conn.close()
+        rows = fetch("SELECT ai_toggle, api_key, model, thresholds, demo_enabled FROM profiles WHERE id=?", (pid,))
+        ai_t, api_k, mdl, thr, dem = (rows[0] if rows else (0,"","gpt-4o-mini","40",0))
+        c1,c2 = st.columns(2)
+        with c1:
+            ai_toggle = st.checkbox("Enable AI Narration", value=bool(int(ai_t or 0)))
+            api_key = st.text_input("OpenAI API Key", type="password", value=api_k or "")
+            model = st.selectbox("AI Model", ["gpt-4o-mini","gpt-4o","gpt-4-turbo"], index=(["gpt-4o-mini","gpt-4o","gpt-4-turbo"].index(mdl) if mdl in ["gpt-4o-mini","gpt-4o","gpt-4-turbo"] else 0))
+        with c2:
+            threshold = st.slider("Letter Resurface Threshold (%)", 0, 100, int(thr or 40))
+            demo_toggle = st.checkbox("Enable Demo Data (seed DemoUser)", value=bool(int(dem or 0)))
+        if st.button("Save Settings"):
+            save("""UPDATE profiles
+                    SET ai_toggle=?, api_key=?, model=?, thresholds=?, demo_enabled=?
+                    WHERE id=?""",
+                 (1 if ai_toggle else 0, api_key, model, str(threshold), 1 if demo_toggle else 0, pid))
+            if demo_toggle:
+                seed_demo()
+            st.success("Settings updated.")
+        if not OpenAI and ai_toggle:
+            st.warning("`openai` Python package not installed. AI will fall back to Lens narration.")
