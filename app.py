@@ -571,12 +571,12 @@ with tabs[6]:
                 c1,c2,c3,c4 = st.columns([1,1,1,3])
                 if stt == "offered":
                     if c1.button("Accept", key=f"a{iid}"):
-                        save("UPDATE interventions SET status=? WHERE id=?", ("accepted", iid)); st.experimental_rerun()
+                        save("UPDATE interventions SET status=? WHERE id=?", ("accepted", iid)); st.rerun()
                     if c2.button("Skip", key=f"s{iid}"):
-                        save("UPDATE interventions SET status=? WHERE id=?", ("skipped", iid)); st.experimental_rerun()
+                        save("UPDATE interventions SET status=? WHERE id=?", ("skipped", iid)); st.rerun()
                 if stt in ("accepted","completed"):
                     if c3.button("Complete", key=f"c{iid}"):
-                        save("UPDATE interventions SET status=?, completed_at=? WHERE id=?", ("completed", datetime.now().isoformat(), iid)); st.experimental_rerun()
+                        save("UPDATE interventions SET status=?, completed_at=? WHERE id=?", ("completed", datetime.now().isoformat(), iid)); st.rerun()
                 if stt == "completed":
                     colh, colr = st.columns([1,3])
                     helpful_sel = colh.selectbox("Helpful?", ["—","Yes","No"], index=(0 if hlp is None else (1 if str(hlp)=="1" else 2)), key=f"h{iid}")
