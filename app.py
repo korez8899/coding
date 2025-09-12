@@ -566,27 +566,36 @@ with tabs[6]:
         ints = fetch("""SELECT id,goal_id,description,status,helpful,reflection,created_at,completed_at
                         FROM interventions WHERE profile_id=? ORDER BY id DESC LIMIT 20""",(pid,))
         if ints:
-            for iid, gid, dsc, stt, hlp, refl, ca, comp in ints:
-                st.markdown(f"**{dsc}** — *{stt}*")
-                c1,c2,c3,c4 = st.columns([1,1,1,3])
-                if stt == "offered":
-                    if c1.button("Accept", key=f"a{iid}"):
-                        save("UPDATE interventions SET status=? WHERE id=?", ("accepted", iid)); st.rerun()
-                    if c2.button("Skip", key=f"s{iid}"):
-                        save("UPDATE interventions SET status=? WHERE id=?", ("skipped", iid)); st.rerun()
-                if stt in ("accepted","completed"):
-                    if c3.button("Complete", key=f"c{iid}"):
-                        save("UPDATE interventions SET status=?, completed_at=? WHERE id=?", ("completed", datetime.now().isoformat(), iid)); st.rerun()
-                if stt == "completed":
-                    colh, colr = st.columns([1,3])
-                    helpful_sel = colh.selectbox("Helpful?", ["—","Yes","No"], index=(0 if hlp is None else (1 if str(hlp)=="1" else 2)), key=f"h{iid}")
-                    refl_txt = colr.text_input("Reflection", value=(refl or ""), key=f"r{iid}")
-                    if st.button("Save Feedback", key=f"fb{iid}"):
-                        helpful_val = None
-                        if helpful_sel == "Yes": helpful_val = 1
-                        elif helpful_sel == "No": helpful_val = 0
-                        save("UPDATE interventions SET helpful=?, reflection=? WHERE id=?", (str(helpful_val) if helpful_val is not None else None, refl_txt, iid))
-                        st.success("Feedback saved.")
+                    for iid, desc, status, completed_date in fetch(
+            "SELECT id, description, status, completed_date FROM interventions WHERE profile_id=?", 
+            (pid,)
+        ):
+            st.write(f"**{desc}** — {status}")
+            
+            # Completion button (only if not already complete)
+            if status != "completed":
+                if st.button("Complete", key=f"complete_{iid}"):
+                    save(
+                        "UPDATE interventions SET status=?, completed_date=? WHERE id=?", 
+                        ("completed", datetime.now().isoformat(), iid)
+                    )
+                    st.rerun()
+            
+            # Feedback form (only for completed items)
+            if status == "completed":
+                helpful = st.selectbox(
+                    "Helpful?", ["Yes", "No"], key=f"helpful_{iid}"
+                )
+                reflection = st.text_input(
+                    "Reflection", key=f"reflection_{iid}"
+                )
+                if st.button("Save Feedback", key=f"feedback_{iid}"):
+                    save(
+                        "UPDATE interventions SET helpful=?, reflection=? WHERE id=?", 
+                        (helpful, reflection, iid)
+                    )
+                    st.success("Feedback saved!")
+
 
 # ---------------------------
 # DIAGNOSTICS
