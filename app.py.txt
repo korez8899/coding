@@ -1,6 +1,7 @@
-# ============================================
-# TimeSculpt – Phase 6.3 Final Expanded Build
-# ============================================
+# =========================
+# TimeSculpt Phase 6.3 Final
+# Fully expanded Blocks 1–15
+# =========================
 
 import streamlit as st
 import sqlite3, bcrypt, random, os
@@ -10,44 +11,43 @@ from datetime import datetime, timedelta
 from openai import OpenAI
 
 # =========================
-# CONFIG & STYLING
+# CONFIG & THEME
 # =========================
 st.set_page_config(page_title="TimeSculpt", layout="wide")
 
 st.markdown("""
 <style>
 body, .stApp {
-    background-color: #0a0a0a;
-    color: #e0e0e0;
-    font-size: 18px;
+    background-color: #fdfdfd;
+    color: #222222;
+    font-size: 17px;
 }
 .stTabs [role="tab"] {
-    color: #e0e0e0 !important;
+    color: #444 !important;
     font-weight: bold;
 }
 .stTabs [role="tab"][aria-selected="true"] {
-    border-bottom: 3px solid gold !important;
+    border-bottom: 3px solid #ffbf00 !important;
 }
 textarea, input, select {
-    background-color: #1a1a1a !important;
-    color: #f0f0f0 !important;
-    border-radius: 8px !important;
+    background-color: #ffffff !important;
+    color: #222 !important;
+    border-radius: 6px !important;
+    border: 1px solid #ccc !important;
 }
 div[data-testid="stMetricValue"] {
-    color: gold !important;
+    color: #ff9900 !important;
     font-weight: bold;
 }
-.reportview-container .main .block-container{
-    padding-top: 1rem;
-    padding-right: 2rem;
-    padding-left: 2rem;
-    padding-bottom: 1rem;
+.stMarkdown, .stText {
+    font-size: 16px;
+    line-height: 1.6;
 }
 </style>
 """, unsafe_allow_html=True)
 
 # =========================
-# DATABASE
+# DB
 # =========================
 DB = "timesculpt.db"
 
@@ -55,57 +55,36 @@ def init_db():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
         c.execute("""CREATE TABLE IF NOT EXISTS profiles(
-                        id INTEGER PRIMARY KEY, 
-                        name TEXT, 
-                        pin_hash TEXT, 
-                        api_key TEXT, 
-                        ai_enabled INT, 
-                        demo INT DEFAULT 0,
-                        traits TEXT,
-                        loops TEXT,
-                        letter TEXT
-                    )""")
+            id INTEGER PRIMARY KEY,
+            name TEXT, pin_hash TEXT,
+            api_key TEXT, ai_enabled INT,
+            demo INT DEFAULT 0,
+            traits TEXT, loops TEXT,
+            letter TEXT, vision TEXT
+        )""")
         c.execute("""CREATE TABLE IF NOT EXISTS goals(
-                        id INTEGER PRIMARY KEY, 
-                        profile_id INT, 
-                        name TEXT, 
-                        target REAL, 
-                        unit TEXT, 
-                        deadline TEXT, 
-                        priority INT,
-                        milestone TEXT
-                    )""")
+            id INTEGER PRIMARY KEY,
+            profile_id INT, name TEXT,
+            target REAL, unit TEXT,
+            deadline TEXT, priority INT,
+            milestones TEXT
+        )""")
         c.execute("""CREATE TABLE IF NOT EXISTS loops(
-                        id INTEGER PRIMARY KEY, 
-                        profile_id INT, 
-                        category TEXT, 
-                        value REAL, 
-                        date TEXT
-                    )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS future_self(
-                        id INTEGER PRIMARY KEY, 
-                        profile_id INT, 
-                        title TEXT, 
-                        traits TEXT, 
-                        loops TEXT, 
-                        letter TEXT,
-                        milestone TEXT
-                    )""")
+            id INTEGER PRIMARY KEY,
+            profile_id INT, category TEXT,
+            value REAL, date TEXT, time TEXT
+        )""")
         c.execute("""CREATE TABLE IF NOT EXISTS interventions(
-                        id INTEGER PRIMARY KEY, 
-                        profile_id INT, 
-                        description TEXT, 
-                        status TEXT, 
-                        completed_date TEXT, 
-                        helpful TEXT, 
-                        reflection TEXT
-                    )""")
+            id INTEGER PRIMARY KEY,
+            profile_id INT, description TEXT,
+            status TEXT, completed_date TEXT,
+            helpful TEXT, reflection TEXT
+        )""")
         c.execute("""CREATE TABLE IF NOT EXISTS lens(
-                        id INTEGER PRIMARY KEY, 
-                        profile_id INT, 
-                        passage TEXT, 
-                        category TEXT
-                    )""")
+            id INTEGER PRIMARY KEY,
+            profile_id INT, passage TEXT,
+            category TEXT
+        )""")
         conn.commit()
 
 def save(q, params=()):
@@ -129,7 +108,7 @@ def current_profile():
     return st.session_state.profile
 
 # =========================
-# NARRATION ENGINE
+# AI + Narration
 # =========================
 def get_ai_client(pid):
     prof = fetch("SELECT api_key, ai_enabled FROM profiles WHERE id=?", (pid,))
@@ -137,7 +116,7 @@ def get_ai_client(pid):
         return OpenAI(api_key=prof[0][0])
     return None
 
-def ai_narration(pid, prompt, categories=None):
+def ai_narration(pid, prompt):
     client = get_ai_client(pid)
     if not client: return None
     try:
@@ -149,47 +128,42 @@ def ai_narration(pid, prompt, categories=None):
     except Exception as e:
         return f"(AI error: {e})"
 
-def blended_lens_line(pid, cats):
-    if not cats: return None
-    rows = fetch("SELECT passage FROM lens WHERE profile_id=? AND category IN (%s)" %
-                 ",".join("?"*len(cats)), [pid]+cats)
+def lens_narration(pid, context):
+    rows = fetch("SELECT passage FROM lens WHERE profile_id=?", (pid,))
     if not rows: return None
-    return random.choice(rows)[0]
+    return f"From your Lens: {random.choice(rows)[0]}"
+
+def blended_narration(pid, context):
+    ai_text = ai_narration(pid, context)
+    if ai_text: return ai_text
+    return lens_narration(pid, context)
 
 # =========================
 # DEMO DATA
 # =========================
 def seed_demo(pid):
     today = datetime.now()
-    # Loops
-    categories = ["write","exercise","scroll","meditate","save","drink","study"]
-    for i in range(45):  # 1.5 months of loops
+    # Loops demo
+    for i in range(45):
         d = today - timedelta(days=i)
-        save("INSERT INTO loops(profile_id, category, value, date) VALUES(?,?,?,?)",
-             (pid, random.choice(categories),
-              random.randint(1,3), d.date().isoformat()))
-    # Goals
-    save("INSERT INTO goals(profile_id,name,target,unit,deadline,priority,milestone) VALUES(?,?,?,?,?,?,?)",
-         (pid,"Finish Book",50,"pages",(today+timedelta(days=30)).isoformat(),5,"Write 20 pages"))
-    save("INSERT INTO goals(profile_id,name,target,unit,deadline,priority,milestone) VALUES(?,?,?,?,?,?,?)",
-         (pid,"Run 10km",10,"km",(today+timedelta(days=15)).isoformat(),4,"Reach 5km comfortably"))
-    # Future self
-    save("INSERT INTO future_self(profile_id,title,traits,loops,letter,milestone) VALUES(?,?,?,?,?,?)",
-         (pid,"Disciplined Writer","Creative, Focused","Daily writing, Exercise",
-          "Keep going. Each day’s line becomes the book.","Publish first draft"))
-    # Interventions
+        save("INSERT INTO loops(profile_id,category,value,date,time) VALUES(?,?,?,?,?)",
+             (pid, random.choice(["write","exercise","scroll","meditate","study","junk"]),
+              random.randint(1,3), d.date().isoformat(), d.strftime("%H:%M")))
+    # Goals demo
+    save("INSERT INTO goals(profile_id,name,target,unit,deadline,priority,milestones) VALUES(?,?,?,?,?,?,?)",
+         (pid,"Finish Book",50,"pages",(today+timedelta(days=30)).isoformat(),5,"10,20,30,40,50"))
+    save("INSERT INTO goals(profile_id,name,target,unit,deadline,priority) VALUES(?,?,?,?,?,?)",
+         (pid,"Lose Weight",5,"kg",(today+timedelta(days=60)).isoformat(),4))
+    # Interventions demo
     save("INSERT INTO interventions(profile_id,description,status) VALUES(?,?,?)",
          (pid,"Write 20m daily","pending"))
     save("INSERT INTO interventions(profile_id,description,status) VALUES(?,?,?)",
-         (pid,"Run every morning","pending"))
-    # Lens
-    passages = [
-        ("Each dawn bends toward clarity.","recursion"),
-        ("The steps you repeat carve the person you become.","emergence"),
-        ("Neutral moments whisper choices.","neutral")
-    ]
-    for text, cat in passages:
-        save("INSERT INTO lens(profile_id,passage,category) VALUES(?,?,?)",(pid,text,cat))
+         (pid,"Evening walk","completed"))
+    # Lens demo
+    save("INSERT INTO lens(profile_id,passage,category) VALUES(?,?,?)",
+         (pid,"Each dawn bends toward clarity.","recursion"))
+    save("INSERT INTO lens(profile_id,passage,category) VALUES(?,?,?)",
+         (pid,"Your actions echo into tomorrow.","emergence"))
 
 # =========================
 # GUIDE TAB
@@ -197,40 +171,18 @@ def seed_demo(pid):
 def show_guide():
     st.header("📖 TimeSculpt Guide")
     st.markdown("""
-Welcome to **TimeSculpt** — a system for sculpting your future self.
+Welcome to **TimeSculpt** — a system for sculpting your future self.  
+Each tab has a purpose, all interconnected:
 
----
-
-### 🔑 Profiles
-Create a profile with a name + PIN. Each profile stores **your entire field** — goals, loops, interventions, lens, and future self identity.
-
-### 🌠 Future Self
-Define your trajectory:  
-- **Traits →** who you are.  
-- **Loops →** key actions your Future Self repeats.  
-- **Letter →** your guidance to yourself.  
-- **Milestone →** a defining checkpoint of becoming.
-
-### 🎯 Goals
-Concrete targets with measurable units, deadlines, and milestones. Goals provide **scaffolding for your loops**.
-
-### 🔄 Loops
-Daily actions. Each loop strengthens or drags your trajectory. Loops fuel Forecast and Diagnostics.
-
-### 📈 Forecast
-Charts show your trajectory. Narration (AI or Lens) translates data into insight. Forecast weaves your loops and goals into a timeline.
-
-### 🛠️ Interventions
-Strategic actions. Plan them, mark them complete, reflect on their helpfulness. Interventions **bend the arc of probability**.
-
-### 📚 Lens
-Passages you feed into the system. They sculpt the narration style, shaping how feedback returns to you.
-
-### ⚖️ Diagnostics
-Reveals **Forces (+)** and **Drags (–)**. Calculates a balance ratio. Narration surfaces the hidden shape of your habits.
-
-### ⚙️ Settings
-Control AI use, API keys, demo data, and resets.  
+- **Profiles** → Secure profiles for different identities.  
+- **Future Self** → Define who you want to become.  
+- **Goals** → Set milestones that shape your trajectory.  
+- **Loops** → Track daily habits that reinforce or break momentum.  
+- **Forecast** → See where your trajectory points.  
+- **Interventions** → Add actions to alter your path.  
+- **Lens** → Narratives and passages to inspire reflection.  
+- **Diagnostics** → See Forces (+) vs Drags (–) in your habits.  
+- **Settings** → Enable AI, demo data, or reset.  
 """)
 
 # =========================
@@ -240,17 +192,11 @@ def show_profiles():
     st.header("👤 Profiles")
     name = st.text_input("Profile Name")
     pin = st.text_input("PIN", type="password")
-    traits = st.text_area("Traits (comma separated)")
-    loops = st.text_area("Loops (comma separated)")
-    letter = st.text_area("Letter to Self")
-
     if st.button("Create Profile"):
         if name and pin:
             hashed = bcrypt.hashpw(pin.encode(), bcrypt.gensalt()).decode()
-            save("INSERT INTO profiles(name,pin_hash,traits,loops,letter) VALUES(?,?,?,?,?)",
-                 (name,hashed,traits,loops,letter))
+            save("INSERT INTO profiles(name,pin_hash) VALUES(?,?)",(name,hashed))
             st.success("Profile created.")
-
     profs = fetch("SELECT id,name FROM profiles")
     if profs:
         sel = st.selectbox("Select Profile",[p[1] for p in profs])
@@ -267,33 +213,60 @@ def show_future():
     st.header("🌠 Future Self")
     pid=current_profile()
     if not pid: st.info("Select a profile"); return
-    title=st.text_input("Future Self Title")
-    traits=st.text_area("Traits (comma separated)")
-    loops=st.text_area("Loops (comma separated)")
-    letter=st.text_area("Letter to Self")
-    milestone=st.text_input("Milestone")
-    if st.button("Save Future Self"):
-        save("INSERT INTO future_self(profile_id,title,traits,loops,letter,milestone) VALUES(?,?,?,?,?,?)",
-             (pid,title,traits,loops,letter,milestone))
+
+    st.markdown("""
+**Define your Future Self:**  
+- Traits → who you are.  
+- Loops → the key actions your Future Self performs.  
+- Letter → your direct guidance to yourself.  
+- Vision → your broader life direction.  
+""")
+    traits=st.text_area("Traits (comma separated)", key=f"traits_{pid}")
+    loops=st.text_area("Loops (comma separated)", key=f"loops_{pid}")
+    letter=st.text_area("Letter to yourself", key=f"letter_{pid}")
+    vision=st.text_area("Vision", key=f"vision_{pid}")
+
+    if st.button("Save Future Self", key=f"save_future_{pid}"):
+        save("""UPDATE profiles SET traits=?,loops=?,letter=?,vision=? WHERE id=?""",
+             (traits,loops,letter,vision,pid))
         st.success("Future Self saved.")
 
+    row=fetch("SELECT traits,loops,letter,vision FROM profiles WHERE id=?",(pid,))
+    if row and any(row[0]):
+        st.subheader("📌 Current Future Self")
+        st.markdown(f"**Traits:** {row[0][0] or ''}")
+        st.markdown(f"**Loops:** {row[0][1] or ''}")
+        st.markdown(f"**Letter:** {row[0][2] or ''}")
+        st.markdown(f"**Vision:** {row[0][3] or ''}")
+
+# =========================
+# (continues with Goals, Loops, Forecast, Interventions, Lens, Diagnostics, Settings…)
 # =========================
 # GOALS TAB
 # =========================
 def show_goals():
     st.header("🎯 Goals")
     pid=current_profile()
-    if not pid: st.info("Select a profile"); return
-    g=st.text_input("Goal Name")
-    t=st.number_input("Target",step=1.0)
-    u=st.text_input("Unit")
-    d=st.date_input("Deadline")
-    p=st.slider("Priority",1,5,3)
-    m=st.text_input("Milestone")
-    if st.button("Save Goal"):
-        save("INSERT INTO goals(profile_id,name,target,unit,deadline,priority,milestone) VALUES(?,?,?,?,?,?,?)",
-             (pid,g,t,u,d.isoformat(),p,m))
+    if not pid: 
+        st.info("Select a profile"); return
+
+    g=st.text_input("Goal Name", key=f"goal_name_{pid}")
+    t=st.number_input("Target",step=1.0, key=f"goal_target_{pid}")
+    u=st.text_input("Unit", key=f"goal_unit_{pid}")
+    d=st.date_input("Deadline", key=f"goal_deadline_{pid}")
+    p=st.slider("Priority",1,5,3, key=f"goal_priority_{pid}")
+    m=st.text_input("Milestones (comma separated)", key=f"goal_milestones_{pid}")
+
+    if st.button("Save Goal", key=f"save_goal_{pid}"):
+        save("""INSERT INTO goals(profile_id,name,target,unit,deadline,priority,milestones) 
+                VALUES(?,?,?,?,?,?,?)""",(pid,g,t,u,d.isoformat(),p,m))
         st.success("Goal saved.")
+
+    rows=fetch("SELECT name,target,unit,deadline,priority,milestones FROM goals WHERE profile_id=?",(pid,))
+    if rows:
+        for name,t,u,dl,p,m in rows:
+            st.markdown(f"**{name}** — {t} {u} by {dl} (Priority {p})")
+            if m: st.caption(f"Milestones: {m}")
 
 # =========================
 # LOOPS TAB
@@ -301,95 +274,62 @@ def show_goals():
 def show_loops():
     st.header("🔄 Loops")
     pid=current_profile()
-    if not pid: st.info("Select a profile"); return
-    c=st.text_input("Category")
-    v=st.number_input("Value",step=1.0)
-    d=st.date_input("Date")
-    if st.button("Log Loop"):
-        save("INSERT INTO loops(profile_id,category,value,date) VALUES(?,?,?,?)",
-             (pid,c,v,d.isoformat()))
+    if not pid: 
+        st.info("Select a profile"); return
+
+    c=st.text_input("Category", key=f"loop_cat_{pid}")
+    v=st.number_input("Value",step=1.0, key=f"loop_val_{pid}")
+    d=st.date_input("Date", key=f"loop_date_{pid}")
+    t=st.time_input("Time", key=f"loop_time_{pid}")
+
+    if st.button("Log Loop", key=f"log_loop_{pid}"):
+        save("INSERT INTO loops(profile_id,category,value,date,time) VALUES(?,?,?,?,?)",
+             (pid,c,v,d.isoformat(),t.strftime("%H:%M")))
         st.success("Loop saved.")
+
+    rows=fetch("SELECT category,value,date,time FROM loops WHERE profile_id=? ORDER BY date DESC LIMIT 10",(pid,))
+    if rows:
+        st.subheader("Recent Loops")
+        for cat,val,date,time in rows:
+            st.write(f"{date} {time} — {cat}: {val}")
 
 # =========================
 # FORECAST TAB
 # =========================
 def show_forecast():
-    pid = current_profile()
-    if not pid:
-        st.info("Select a profile to see forecast.")
-        return
-
     st.header("📈 Forecast")
+    pid=current_profile()
+    if not pid: 
+        st.info("Select a profile"); return
 
-    # Get goals for this profile
-    goals = fetch("SELECT id, name, target, unit, deadline, priority FROM goals WHERE profile_id=?", (pid,))
+    goals=fetch("SELECT id,name,target,unit,deadline,milestones FROM goals WHERE profile_id=?",(pid,))
+    if not goals: 
+        st.info("No goals."); return
 
-    if not goals:
-        st.warning("No goals yet. Add some in the Goals tab.")
-        return
+    for gid,name,t,u,dl,m in goals:
+        loops=fetch("SELECT SUM(value) FROM loops WHERE profile_id=?",(pid,))
+        done=loops[0][0] or 0
+        perc=done/t if t else 0
 
-    # Calculate progress for each goal
-    today = datetime.now().date()
-    for gid, name, target, unit, deadline, priority in goals:
-        loops = fetch("SELECT value, date FROM loops WHERE profile_id=? AND category LIKE ?", (pid, f"%{name}%"))
-        total = sum([float(v) for v, d in loops if v])
-
-        try:
-            progress = (total / float(target)) * 100 if target else 0
-        except ZeroDivisionError:
-            progress = 0
-
-        # --- Gauge chart ---
-        fig_g = go.Figure(go.Indicator(
+        fig_g=go.Figure(go.Indicator(
             mode="gauge+number",
-            value=progress,
-            title={'text': f"{name} Progress", 'font': {'size': 18, 'color': "#e0e0e0"}},
-            number={'font': {'size': 28, 'color': "#ffd700"}},
-            gauge={
-                'axis': {'range': [0, 100], 'tickfont': {'color': "#e0e0e0"}},
-                'bar': {'color': "#ffd700"},
-                'bgcolor': "#1c1c1c",
-                'borderwidth': 2,
-                'bordercolor': "#2a2f45"
-            }
+            value=perc*100,
+            title={'text': f"{name} Progress"},
+            gauge={'axis':{'range':[0,100]},
+                   'bar':{'color':"#ff9900"},
+                   'bgcolor':"white",
+                   'borderwidth':1,'bordercolor':"#ccc"}
         ))
-        fig_g.update_layout(
-            margin=dict(l=20, r=20, t=40, b=20),
-            paper_bgcolor="#0a0a0a",
-            font=dict(color="#e0e0e0", size=14)
-        )
+        st.plotly_chart(fig_g,use_container_width=True)
 
-        st.plotly_chart(fig_g, use_container_width=True, key=f"forecast_gauge_{pid}_{gid}")
+        st.metric(f"{name} Progress", f"{perc*100:.1f}%")
 
-        # --- Trend chart (progress over time) ---
-        if loops:
-            df = pd.DataFrame(loops, columns=["value", "date"])
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.groupby("date").sum().reset_index()
+        narr=blended_narration(pid,f"Goal {name}, progress {perc*100:.1f}%")
+        if narr: 
+            st.markdown(f"*{narr}*")
 
-            fig_t = px.line(
-                df, x="date", y="value",
-                title=f"{name} – Progress Over Time",
-                markers=True
-            )
-            fig_t.update_traces(line_color="#ffd700", marker=dict(size=6))
-            fig_t.update_layout(
-                plot_bgcolor="#0a0a0a",
-                paper_bgcolor="#0a0a0a",
-                font=dict(color="#e0e0e0"),
-                margin=dict(l=20, r=20, t=40, b=20)
-            )
-
-            st.plotly_chart(fig_t, use_container_width=True, key=f"forecast_trend_{pid}_{gid}")
-
-        # --- Narration (Lens / AI) ---
-        if get_ai_client(pid):
-            narration = ai_narration(pid, f"Goal '{name}' progress is {progress:.2f}%. Forecast its outcome.")
-        else:
-            narration = blended_lens_line(pid, ["recursion", "emergence"]) or "Your path is unfolding."
-        
-        st.markdown(f"**Narration:** {narration}")
-        st.markdown("---")
+        if m:
+            st.caption(f"Milestones: {m}")
 
 # =========================
 # INTERVENTIONS TAB
@@ -397,22 +337,28 @@ def show_forecast():
 def show_interventions():
     st.header("🛠️ Interventions")
     pid=current_profile()
-    if not pid: st.info("Select a profile"); return
-    d=st.text_input("Description")
-    if st.button("Add Intervention"):
+    if not pid: 
+        st.info("Select a profile"); return
+
+    d=st.text_input("Description", key=f"intervention_desc_{pid}")
+    if st.button("Add Intervention", key=f"add_intervention_{pid}"):
         save("INSERT INTO interventions(profile_id,description,status) VALUES(?,?,?)",(pid,d,"pending"))
+        st.success("Intervention added.")
+
     rows=fetch("SELECT id,description,status,completed_date,helpful,reflection FROM interventions WHERE profile_id=?",(pid,))
-    for iid,desc,status,cd,helpful,ref in rows:
+    for iid,desc,status,cd,h,ref in rows:
         st.write(f"**{desc}** — {status}")
         if status!="completed":
-            if st.button("Complete",key=f"c{iid}"):
-                save("UPDATE interventions SET status=?,completed_date=? WHERE id=?",("completed",datetime.now().isoformat(),iid))
+            if st.button("Complete",key=f"comp_{iid}"):
+                save("UPDATE interventions SET status=?,completed_date=? WHERE id=?",
+                     ("completed",datetime.now().isoformat(),iid))
                 st.rerun()
         if status=="completed":
-            h=st.selectbox("Helpful?",["Yes","No"],key=f"h{iid}",index=0 if not helpful else ["Yes","No"].index(helpful))
-            r=st.text_input("Reflection",value=ref or "",key=f"r{iid}")
-            if st.button("Save Feedback",key=f"s{iid}"):
-                save("UPDATE interventions SET helpful=?,reflection=? WHERE id=?",(h,r,iid))
+            h_sel=st.selectbox("Helpful?",["Yes","No"],index=0 if not h else ["Yes","No"].index(h),
+                               key=f"h_{iid}")
+            r=st.text_input("Reflection",value=ref or "",key=f"r_{iid}")
+            if st.button("Save Feedback",key=f"s_{iid}"):
+                save("UPDATE interventions SET helpful=?,reflection=? WHERE id=?",(h_sel,r,iid))
                 st.success("Feedback saved.")
 
 # =========================
@@ -421,12 +367,20 @@ def show_interventions():
 def show_lens():
     st.header("📚 Lens")
     pid=current_profile()
-    if not pid: st.info("Select a profile"); return
-    passage=st.text_area("Passage")
-    cat=st.selectbox("Category",["recursion","emergence","neutral"])
-    if st.button("Add Passage"):
+    if not pid: 
+        st.info("Select a profile"); return
+
+    passage=st.text_area("Passage", key=f"lens_passage_{pid}")
+    cat=st.selectbox("Category",["recursion","emergence","neutral"], key=f"lens_cat_{pid}")
+    if st.button("Add Passage", key=f"add_passage_{pid}"):
         save("INSERT INTO lens(profile_id,passage,category) VALUES(?,?,?)",(pid,passage,cat))
-    rows=fetch("SELECT passage,category FROM lens WHERE profile_id=?",(pid,))
+        st.success("Passage added.")
+
+    q=st.text_input("🔍 Search Lens", key=f"lens_search_{pid}")
+    if q:
+        rows=fetch("SELECT passage,category FROM lens WHERE profile_id=? AND passage LIKE ?",(pid,f"%{q}%"))
+    else:
+        rows=fetch("SELECT passage,category FROM lens WHERE profile_id=?",(pid,))
     for p,c in rows:
         st.markdown(f"**{c}:** {p}")
 
@@ -436,25 +390,33 @@ def show_lens():
 def show_diag():
     st.header("⚖️ Diagnostics")
     pid=current_profile()
-    if not pid: st.info("Select a profile"); return
+    if not pid: 
+        st.info("Select a profile"); return
+
     loops=fetch("SELECT category,value,date FROM loops WHERE profile_id=?",(pid,))
-    if not loops: st.info("No loops."); return
-    forces,drags,neutral={}, {}, {}
+    if not loops: 
+        st.info("No loops."); return
+
+    forces,drags={}, {}
     fk=["write","exercise","save","sleep","study","meditate","walk","water"]
     dk=["scroll","late","junk","skip","procrastinate","smoke","drink"]
     for c,v,d in loops:
         cl=c.lower()
-        if any(w in cl for w in fk): forces[c]=forces.get(c,0)+v
-        elif any(w in cl for w in dk): drags[c]=drags.get(c,0)+v
-        else: neutral[c]=neutral.get(c,0)+v
-    if forces: st.plotly_chart(px.bar(x=list(forces.keys()),y=list(forces.values()),title="Forces (+)",labels={"x":"Loop","y":"Value"}))
-    if drags: st.plotly_chart(px.bar(x=list(drags.keys()),y=list(drags.values()),title="Drags (-)",labels={"x":"Loop","y":"Value"}))
+        if any(w in cl for w in fk): forces[d]=forces.get(d,0)+v
+        elif any(w in cl for w in dk): drags[d]=drags.get(d,0)+v
+
+    if forces: 
+        st.plotly_chart(px.line(x=list(forces.keys()),y=list(forces.values()),title="Forces (+) Over Time"),use_container_width=True)
+    if drags: 
+        st.plotly_chart(px.line(x=list(drags.keys()),y=list(drags.values()),title="Drags (–) Over Time"),use_container_width=True)
+
     tf,td=sum(forces.values()),sum(drags.values())
     if tf+td>0:
         ratio=tf/(tf+td)
         st.metric("Forces/Drags Balance",f"{ratio:.2f}")
-        narr=ai_narration(pid,f"Forces {tf}, Drags {td}, Ratio {ratio:.2f}")
-        if narr: st.markdown(f"*{narr}*")
+        narr=blended_narration(pid,f"Forces {tf}, Drags {td}, Ratio {ratio:.2f}")
+        if narr: 
+            st.markdown(f"*{narr}*")
 
 # =========================
 # SETTINGS TAB
@@ -462,22 +424,30 @@ def show_diag():
 def show_settings():
     st.header("⚙️ Settings")
     pid=current_profile()
-    if not pid: st.info("Select a profile"); return
-    ai_on=st.checkbox("Enable AI",key=f"ai_{pid}")
-    api=st.text_input("OpenAI API Key",type="password",key=f"api_{pid}")
-    demo=st.checkbox("Enable Demo Data",key=f"demo_{pid}")
-    if st.button("Save Settings",key=f"sav_{pid}"):
-        save("UPDATE profiles SET ai_enabled=?,api_key=?,demo=? WHERE id=?",(1 if ai_on else 0,api,demo,pid))
-        if demo: seed_demo(pid)
+    if not pid: 
+        st.info("Select a profile"); return
+
+    prof=fetch("SELECT ai_enabled,api_key,demo FROM profiles WHERE id=?",(pid,))
+    ai_on,api,demo=(prof[0] if prof else (0,"",0))
+
+    ai_on_new=st.toggle("Enable AI",bool(ai_on), key=f"ai_toggle_{pid}")
+    api_new=st.text_input("OpenAI API Key",api,type="password", key=f"api_{pid}")
+    demo_new=st.toggle("Enable Demo Data",bool(demo), key=f"demo_{pid}")
+
+    if st.button("Save Settings", key=f"save_settings_{pid}"):
+        save("UPDATE profiles SET ai_enabled=?,api_key=?,demo=? WHERE id=?",(1 if ai_on_new else 0,api_new,1 if demo_new else 0,pid))
+        if demo_new: seed_demo(pid)
         st.success("Settings saved.")
 
 # =========================
-# MAIN
+# MAIN NAVIGATION
 # =========================
 tabs=st.tabs([
-    "📖 Guide","👤 Profiles","🌠 Future Self","🎯 Goals","🔄 Loops",
-    "📈 Forecast","🛠️ Interventions","📚 Lens","⚖️ Diagnostics","⚙️ Settings"
+    "📖 Guide","👤 Profiles","🌠 Future Self","🎯 Goals",
+    "🔄 Loops","📈 Forecast","🛠️ Interventions",
+    "📚 Lens","⚖️ Diagnostics","⚙️ Settings"
 ])
+
 with tabs[0]: show_guide()
 with tabs[1]: show_profiles()
 with tabs[2]: show_future()
