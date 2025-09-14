@@ -160,36 +160,52 @@ def blended_lens_line(pid, cats):
 # DEMO DATA
 # =========================
 def seed_demo(pid):
-    today = datetime.now()
-    # Loops
-    categories = ["write","exercise","scroll","meditate","save","drink","study"]
-    for i in range(45):  # 1.5 months of loops
-        d = today - timedelta(days=i)
-        save("INSERT INTO loops(profile_id, category, value, date) VALUES(?,?,?,?)",
-             (pid, random.choice(categories),
-              random.randint(1,3), d.date().isoformat()))
-    # Goals
-    save("INSERT INTO goals(profile_id,name,target,unit,deadline,priority,milestone) VALUES(?,?,?,?,?,?,?)",
-         (pid,"Finish Book",50,"pages",(today+timedelta(days=30)).isoformat(),5,"Write 20 pages"))
-    save("INSERT INTO goals(profile_id,name,target,unit,deadline,priority,milestone) VALUES(?,?,?,?,?,?,?)",
-         (pid,"Run 10km",10,"km",(today+timedelta(days=15)).isoformat(),4,"Reach 5km comfortably"))
-    # Future self
-    save("INSERT INTO future_self(profile_id,title,traits,loops,letter,milestone) VALUES(?,?,?,?,?,?)",
-         (pid,"Disciplined Writer","Creative, Focused","Daily writing, Exercise",
-          "Keep going. Each day’s line becomes the book.","Publish first draft"))
-    # Interventions
-    save("INSERT INTO interventions(profile_id,description,status) VALUES(?,?,?)",
-         (pid,"Write 20m daily","pending"))
-    save("INSERT INTO interventions(profile_id,description,status) VALUES(?,?,?)",
-         (pid,"Run every morning","pending"))
-    # Lens
-    passages = [
-        ("Each dawn bends toward clarity.","recursion"),
-        ("The steps you repeat carve the person you become.","emergence"),
-        ("Neutral moments whisper choices.","neutral")
+    today = datetime.now().date()
+
+    # Wipe existing demo data first
+    save("DELETE FROM loops WHERE profile_id=? AND category LIKE '[DEMO]%'", (pid,))
+    save("DELETE FROM goals WHERE profile_id=? AND name LIKE '[DEMO]%'", (pid,))
+    save("DELETE FROM interventions WHERE profile_id=? AND description LIKE '[DEMO]%'", (pid,))
+    save("DELETE FROM lens WHERE profile_id=? AND passage LIKE '[DEMO]%'", (pid,))
+
+    # Insert demo goals
+    demo_goals = [
+        ("[DEMO] Finish Book", 50, "pages", today + timedelta(days=30), 1),
+        ("[DEMO] Daily Workout", 20, "sessions", today + timedelta(days=14), 2),
+        ("[DEMO] Meditate", 15, "sessions", today + timedelta(days=10), 3),
     ]
-    for text, cat in passages:
-        save("INSERT INTO lens(profile_id,passage,category) VALUES(?,?,?)",(pid,text,cat))
+    for name, target, unit, deadline, priority in demo_goals:
+        save("INSERT INTO goals(profile_id, name, target, unit, deadline, priority) VALUES(?,?,?,?,?,?)",
+             (pid, name, target, unit, deadline.isoformat(), priority))
+
+    # Insert demo loops (progress logs)
+    for i in range(15):  # 15 days of demo logs
+        d = today - timedelta(days=15-i)
+        save("INSERT INTO loops(profile_id, category, value, date) VALUES(?,?,?,?)",
+             (pid, "[DEMO] Finish Book", random.randint(1, 5), d.isoformat()))
+        save("INSERT INTO loops(profile_id, category, value, date) VALUES(?,?,?,?)",
+             (pid, "[DEMO] Daily Workout", 1, d.isoformat() if i % 2 == 0 else None))
+        save("INSERT INTO loops(profile_id, category, value, date) VALUES(?,?,?,?)",
+             (pid, "[DEMO] Meditate", 1, d.isoformat() if i % 3 == 0 else None))
+
+    # Insert demo interventions
+    demo_interventions = [
+        ("[DEMO] Write 20m daily", "pending"),
+        ("[DEMO] Stretch after workout", "completed"),
+        ("[DEMO] Evening reflection journaling", "pending"),
+    ]
+    for desc, status in demo_interventions:
+        save("INSERT INTO interventions(profile_id, description, status) VALUES(?,?,?)", (pid, desc, status))
+
+    # Insert demo lens passages
+    demo_lens = [
+        ("[DEMO] Each dawn bends toward clarity.", "recursion"),
+        ("[DEMO] Small actions converge into irreversible momentum.", "emergence"),
+        ("[DEMO] Even silence sculpts.", "neutral"),
+    ]
+    for passage, cat in demo_lens:
+        save("INSERT INTO lens(profile_id, passage, category) VALUES(?,?,?)", (pid, passage, cat))
+
 
 # =========================
 # GUIDE TAB
@@ -266,22 +282,30 @@ def show_profiles():
 def show_future():
     st.header("🌠 Future Self")
     pid = current_profile()
-    if not pid: 
-        st.info("Select a profile")
+    if not pid:
+        st.info("Select a profile to define your Future Self.")
         return
 
-    title = st.text_input("Future Self Title", key=f"title_{pid}")
-    traits = st.text_area("Traits (comma separated)", key=f"future_traits_{pid}")
-    loops = st.text_area("Loops (comma separated)", key=f"future_loops_{pid}")
-    letter = st.text_area("Letter to Self", key=f"future_letter_{pid}")
-    milestone = st.text_input("Milestone", key=f"future_milestone_{pid}")
+    # Retrieve stored data
+    data = fetch("SELECT title, traits, loops, letter, obstacles, milestones FROM future_self WHERE profile_id=?", (pid,))
+    title, traits, loops, letter, obstacles, milestones = (data[0] if data else ("","","","","",""))
+
+    # Inputs with unique keys
+    title = st.text_input("Title", title, key=f"future_title_{pid}")
+    traits = st.text_area("Traits (comma separated)", traits, key=f"future_traits_{pid}")
+    loops = st.text_area("Loops (habits/actions, comma separated)", loops, key=f"future_loops_{pid}")
+    letter = st.text_area("Letter to Self", letter, key=f"future_letter_{pid}")
+    obstacles = st.text_area("Obstacles", obstacles, key=f"future_obstacles_{pid}")
+    milestones = st.text_area("Milestones (comma separated)", milestones, key=f"future_milestones_{pid}")
 
     if st.button("Save Future Self", key=f"save_future_{pid}"):
-        save(
-            "INSERT INTO future_self(profile_id,title,traits,loops,letter,milestone) VALUES(?,?,?,?,?,?)",
-            (pid, title, traits, loops, letter, milestone)
-        )
-        st.success("Future Self saved.")
+        if data:
+            save("UPDATE future_self SET title=?, traits=?, loops=?, letter=?, obstacles=?, milestones=? WHERE profile_id=?",
+                 (title, traits, loops, letter, obstacles, milestones, pid))
+        else:
+            save("INSERT INTO future_self(profile_id, title, traits, loops, letter, obstacles, milestones) VALUES(?,?,?,?,?,?,?)",
+                 (pid, title, traits, loops, letter, obstacles, milestones))
+        st.success("Future Self updated!")
 
 
 # =========================
@@ -321,31 +345,82 @@ def show_loops():
 # FORECAST TAB
 # =========================
 def show_forecast():
+    pid = current_profile()
+    if not pid:
+        st.info("Select a profile to see forecast.")
+        return
+
     st.header("📈 Forecast")
-    pid=current_profile()
-    if not pid: st.info("Select a profile"); return
-    goals=fetch("SELECT id,name,target,unit,deadline,priority,milestone FROM goals WHERE profile_id=?",(pid,))
-    if not goals: st.info("No goals."); return
-    for gid,name,t,u,dl,p,m in goals:
-        loops=fetch("SELECT SUM(value) FROM loops WHERE profile_id=?",(pid,))
-        done=loops[0][0] or 0
-        perc=done/t if t else 0
+
+    # Get goals for this profile
+    goals = fetch("SELECT id, name, target, unit, deadline, priority FROM goals WHERE profile_id=?", (pid,))
+
+    if not goals:
+        st.warning("No goals yet. Add some in the Goals tab.")
+        return
+
+    # Calculate progress for each goal
+    today = datetime.now().date()
+    for gid, name, target, unit, deadline, priority in goals:
+        loops = fetch("SELECT value, date FROM loops WHERE profile_id=? AND category LIKE ?", (pid, f"%{name}%"))
+        total = sum([float(v) for v, d in loops if v])
+
+        try:
+            progress = (total / float(target)) * 100 if target else 0
+        except ZeroDivisionError:
+            progress = 0
+
+        # --- Gauge chart ---
         fig_g = go.Figure(go.Indicator(
             mode="gauge+number",
-            value=perc*100,
-            title={"text":f"{name} Progress"},
+            value=progress,
+            title={'text': f"{name} Progress", 'font': {'size': 18, 'color': "#e0e0e0"}},
+            number={'font': {'size': 28, 'color': "#ffd700"}},
             gauge={
-                "axis":{"range":[0,100]},
-                "bar":{"color":"gold"},
-                "bgcolor":"black",
-                "borderwidth":2,
-                "bordercolor":"#2a2f45"
+                'axis': {'range': [0, 100], 'tickfont': {'color': "#e0e0e0"}},
+                'bar': {'color': "#ffd700"},
+                'bgcolor': "#1c1c1c",
+                'borderwidth': 2,
+                'bordercolor': "#2a2f45"
             }
         ))
-        st.plotly_chart(fig_g,use_container_width=True)
-        st.metric(f"{name} %", f"{perc*100:.1f}%")
-        narr=ai_narration(pid,f"Goal {name}, progress {perc*100:.1f}%. Milestone: {m}")
-        if narr: st.markdown(f"*{narr}*")
+        fig_g.update_layout(
+            margin=dict(l=20, r=20, t=40, b=20),
+            paper_bgcolor="#0a0a0a",
+            font=dict(color="#e0e0e0", size=14)
+        )
+
+        st.plotly_chart(fig_g, use_container_width=True, key=f"forecast_gauge_{pid}_{gid}")
+
+        # --- Trend chart (progress over time) ---
+        if loops:
+            df = pd.DataFrame(loops, columns=["value", "date"])
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.groupby("date").sum().reset_index()
+
+            fig_t = px.line(
+                df, x="date", y="value",
+                title=f"{name} – Progress Over Time",
+                markers=True
+            )
+            fig_t.update_traces(line_color="#ffd700", marker=dict(size=6))
+            fig_t.update_layout(
+                plot_bgcolor="#0a0a0a",
+                paper_bgcolor="#0a0a0a",
+                font=dict(color="#e0e0e0"),
+                margin=dict(l=20, r=20, t=40, b=20)
+            )
+
+            st.plotly_chart(fig_t, use_container_width=True, key=f"forecast_trend_{pid}_{gid}")
+
+        # --- Narration (Lens / AI) ---
+        if get_ai_client(pid):
+            narration = ai_narration(pid, f"Goal '{name}' progress is {progress:.2f}%. Forecast its outcome.")
+        else:
+            narration = blended_lens_line(pid, ["recursion", "emergence"]) or "Your path is unfolding."
+        
+        st.markdown(f"**Narration:** {narration}")
+        st.markdown("---")
 
 # =========================
 # INTERVENTIONS TAB
