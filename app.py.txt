@@ -412,37 +412,112 @@ def show_diagnostics(conn, profile_id: int, api_key: str | None, use_ai: bool):
 # Lens (Meaning Field)
 # ======================
 
-def add_lens_entry(conn, profile_id: int, text: str, category: str, source: str):
-    c = conn.cursor()
-    c.execute("INSERT INTO lens (profile_id, text, category, source) VALUES (?, ?, ?, ?)",
-              (profile_id, text, category, source))
-    conn.commit()
+# ----------------------
+# Lens Helpers
+# ----------------------
 
-def get_lens_entries(conn, profile_id: int):
-    c = conn.cursor()
-    c.execute("SELECT id, text, category, source, active FROM lens WHERE profile_id=?", (profile_id,))
-    return c.fetchall()
+def chunk_text(text, max_words=500):
+    """Split long text into manageable chunks by words."""
+    words = text.split()
+    for i in range(0, len(words), max_words):
+        yield " ".join(words[i:i+max_words])
+
+def process_upload(conn, uploaded, profile_id):
+    """Handle uploaded file and insert chunks into Lens."""
+    source = uploaded.name
+    file_type = uploaded.type
+
+    # TXT
+    if file_type == "text/plain":
+        text = uploaded.read().decode("utf-8")
+        for chunk_num, chunk in enumerate(chunk_text(text), start=1):
+            conn.execute(
+                "INSERT INTO lens (profile_id, text, category, source, created_at, active) "
+                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1)",
+                (profile_id, chunk, "general", f"{source}-c{chunk_num}")
+            )
+        conn.commit()
+
+    # PDF
+    elif file_type == "application/pdf" and PyPDF2:
+        reader = PyPDF2.PdfReader(uploaded)
+        for i, page in enumerate(reader.pages, start=1):
+            page_text = page.extract_text()
+            if page_text:
+                for chunk_num, chunk in enumerate(chunk_text(page_text), start=1):
+                    conn.execute(
+                        "INSERT INTO lens (profile_id, text, category, source, created_at, active) "
+                        "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1)",
+                        (profile_id, chunk, f"Page {i}", f"{source} (p{i}-c{chunk_num})")
+                    )
+        conn.commit()
+
+    # DOCX
+    elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" and docx:
+        doc = docx.Document(uploaded)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        for chunk_num, chunk in enumerate(chunk_text(text), start=1):
+            conn.execute(
+                "INSERT INTO lens (profile_id, text, category, source, created_at, active) "
+                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1)",
+                (profile_id, chunk, "general", f"{source}-c{chunk_num}")
+            )
+        conn.commit()
+
+
+# ----------------------
+# Lens Tab
+# ----------------------
 
 def show_lens(conn, profile_id: int):
     st.header("📚 Lens — Meaning")
+    st.markdown("Upload or write passages. Passages are woven into narration and reflection across the app.")
 
-    # Add new entry
+    # --- Upload Files ---
+    uploaded = st.file_uploader("Upload .txt, .pdf, .docx",
+                                type=["txt", "pdf", "docx"])
+    if uploaded:
+        st.info(f"Processing: {uploaded.name}")
+        process_upload(conn, uploaded, profile_id)
+        st.success("Passages saved into Lens (chunked).")
+
+    # --- Manual Entry ---
     with st.expander("➕ Add Lens Entry"):
-        lens_text = st.text_area("Text / Quote / Reflection")
-        category = st.text_input("Category (optional)")
-        source = st.text_input("Source (optional)")
+        text = st.text_area("Text / Quote / Reflection")
+        category = st.text_input("Category (optional)", "general")
+        source = st.text_input("Source (optional)", "manual")
         if st.button("Save Entry"):
-            if lens_text.strip():
-                add_lens_entry(conn, profile_id, lens_text.strip(), category.strip(), source.strip())
-                st.success("Entry added to Lens.")
+            if text:
+                conn.execute(
+                    "INSERT INTO lens (profile_id, text, category, source, created_at, active) "
+                    "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1)",
+                    (profile_id, text, category, source)
+                )
+                conn.commit()
+                st.success("Passage added.")
 
-    # Show entries
-    entries = get_lens_entries(conn, profile_id)
-    for eid, text, category, source, active in entries:
-        st.write(f"**{category or 'General'}** — {source or 'Unknown'}")
-        st.caption(text)
-        st.toggle("Active", value=bool(active), key=f"lens_active_{eid}")
-        st.divider()
+    # --- Search + Display ---
+    st.subheader("🔍 Search Lens")
+    search = st.text_input("Enter keyword(s)")
+    if search:
+        rows = conn.execute(
+            "SELECT text, category, source FROM lens WHERE profile_id=? AND text LIKE ? ORDER BY created_at DESC",
+            (profile_id, f"%{search}%")
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT text, category, source FROM lens WHERE profile_id=? ORDER BY created_at DESC",
+            (profile_id,)
+        ).fetchall()
+
+    if rows:
+        for text, cat, src in rows:
+            st.markdown(f"**{cat}** ({src})")
+            st.write(text)
+            st.markdown("---")
+    else:
+        st.info("No passages found.")
+
 
 
 # ======================

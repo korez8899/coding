@@ -27,7 +27,7 @@ from graphviz import Digraph
 # ----------------------
 # Config & Styling
 # ----------------------
-st.set_page_config(page_title="TimeSculpt Navigator 6.4", page_icon="⏳", layout="wide")
+st.set_page_config(page_title="TimeSculpt", page_icon="⏳", layout="wide")
 
 st.markdown("""
 <style>
@@ -412,37 +412,253 @@ def show_diagnostics(conn, profile_id: int, api_key: str | None, use_ai: bool):
 # Lens (Meaning Field)
 # ======================
 
-def add_lens_entry(conn, profile_id: int, text: str, category: str, source: str):
-    c = conn.cursor()
-    c.execute("INSERT INTO lens (profile_id, text, category, source) VALUES (?, ?, ?, ?)",
-              (profile_id, text, category, source))
+# ----------------------
+# Lens Helpers
+# ----------------------
+
+def chunk_text(text, max_words=500):
+    """Split long text into manageable chunks by words."""
+    words = text.split()
+    for i in range(0, len(words), max_words):
+        yield " ".join(words[i:i+max_words])
+
+def process_upload(conn, uploaded, profile_id):
+    """Handle uploaded file and insert chunks into Lens."""
+    source = uploaded.name
+    file_type = uploaded.type
+
+    # TXT
+    if file_type == "text/plain":
+        text = uploaded.read().decode("utf-8")
+        for chunk_num, chunk in enumerate(chunk_text(text), start=1):
+            conn.execute(
+                "INSERT INTO lens (profile_id, text, category, source, created_at, active) "
+                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1)",
+                (profile_id, chunk, "general", f"{source}-c{chunk_num}")
+            )
+        conn.commit()
+
+    # PDF
+    elif file_type == "application/pdf" and PyPDF2:
+        reader = PyPDF2.PdfReader(uploaded)
+        for i, page in enumerate(reader.pages, start=1):
+            page_text = page.extract_text()
+            if page_text:
+                for chunk_num, chunk in enumerate(chunk_text(page_text), start=1):
+                    conn.execute(
+                        "INSERT INTO lens (profile_id, text, category, source, created_at, active) "
+                        "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1)",
+                        (profile_id, chunk, f"Page {i}", f"{source} (p{i}-c{chunk_num})")
+                    )
+        conn.commit()
+
+    # DOCX
+    elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" and docx:
+        doc = docx.Document(uploaded)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        for chunk_num, chunk in enumerate(chunk_text(text), start=1):
+            conn.execute(
+                "INSERT INTO lens (profile_id, text, category, source, created_at, active) "
+                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1)",
+                (profile_id, chunk, "general", f"{source}-c{chunk_num}")
+            )
+        conn.commit()
+
+
+# ----------------------
+# Lens Tab
+# ----------------------
+
+# ----------------------
+# Lens Helpers
+# ----------------------
+
+import re
+from collections import Counter
+
+def chunk_text(text, max_words=500):
+    """Split long text into manageable chunks by words."""
+    words = text.split()
+    for i in range(0, len(words), max_words):
+        yield " ".join(words[i:i+max_words])
+
+def keyword_summary(texts, top_n=20):
+    """Generate a keyword-based summary (AI off)."""
+    if not texts:
+        return "No text available to summarize."
+
+    all_text = " ".join(texts).lower()
+    words = re.findall(r'\b[a-zA-Z]{4,}\b', all_text)
+
+    stopwords = {
+        "this","that","with","from","about","there","their","which","where",
+        "when","these","those","your","into","have","been","will","shall","would",
+        "could","should","then","than","also","some","such","more","like","very",
+        "just","only","even"
+    }
+    words = [w for w in words if w not in stopwords]
+
+    counts = Counter(words).most_common(top_n)
+    if not counts:
+        return "No meaningful keywords found."
+
+    keyword_list = [f"{word} ({count})" for word, count in counts]
+    return "Key themes detected:\n- " + "\n- ".join(keyword_list)
+
+def save_summary_to_lens(conn, profile_id: int, text: str, source: str = "system"):
+    """Save generated summary as inactive Lens entry."""
+    conn.execute(
+        "INSERT INTO lens (profile_id, text, category, source, created_at, active) "
+        "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 0)",   # inactive by default
+        (profile_id, text, "summary", source)
+    )
     conn.commit()
 
-def get_lens_entries(conn, profile_id: int):
+def process_upload(conn, uploaded, profile_id, api_key=None, use_ai=False, narration_length="Short"):
+    """Handle uploaded file, insert chunks into Lens, and optionally auto-summarize."""
+    source = uploaded.name
+    file_type = uploaded.type
+    text = ""
+
+    # TXT
+    if file_type == "text/plain":
+        text = uploaded.read().decode("utf-8")
+
+    # PDF
+    elif file_type == "application/pdf" and PyPDF2:
+        reader = PyPDF2.PdfReader(uploaded)
+        for i, page in enumerate(reader.pages, start=1):
+            page_text = page.extract_text()
+            if page_text:
+                for chunk_num, chunk in enumerate(chunk_text(page_text), start=1):
+                    conn.execute(
+                        "INSERT INTO lens (profile_id, text, category, source, created_at, active) "
+                        "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1)",
+                        (profile_id, chunk, f"Page {i}", f"{source} (p{i}-c{chunk_num})")
+                    )
+        conn.commit()
+
+    # DOCX
+    elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" and docx:
+        doc = docx.Document(uploaded)
+        text = "\n".join(p.text for p in doc.paragraphs)
+
+    # Store TXT/DOCX chunks
+    if text:
+        for chunk_num, chunk in enumerate(chunk_text(text), start=1):
+            conn.execute(
+                "INSERT INTO lens (profile_id, text, category, source, created_at, active) "
+                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1)",
+                (profile_id, chunk, "general", f"{source}-c{chunk_num}")
+            )
+        conn.commit()
+
+    # --- Auto-summarize ---
     c = conn.cursor()
-    c.execute("SELECT id, text, category, source, active FROM lens WHERE profile_id=?", (profile_id,))
-    return c.fetchall()
+    c.execute("SELECT text FROM lens WHERE profile_id=? AND source LIKE ?", (profile_id, f"{source}%"))
+    chunks = [row[0] for row in c.fetchall()]
 
-def show_lens(conn, profile_id: int):
+    if chunks:
+        if use_ai and api_key:
+            style = get_narration_style(narration_length)
+            combined = "\n".join(chunks[:5])
+            prompt = (
+                f"Here are the opening passages from {source}:\n\n{combined}\n\n"
+                f"Summarize the themes in TimeSculpt’s tone. {style}"
+            )
+            summary = ai_narrate(prompt, api_key)
+            if summary:
+                st.success("Auto-summary generated (inactive by default):")
+                st.info(summary)
+                save_summary_to_lens(conn, profile_id, summary, source=f"{source} (summary)")
+        else:
+            fallback = keyword_summary(chunks, top_n=20)
+            st.success("Keyword-based summary generated (inactive by default):")
+            st.info(fallback)
+            save_summary_to_lens(conn, profile_id, fallback, source=f"{source} (summary)")
+
+# ----------------------
+# Lens Tab
+# ----------------------
+
+def show_lens(conn, profile_id: int, api_key=None, use_ai=False, narration_length="Short"):
     st.header("📚 Lens — Meaning")
+    st.markdown("Upload or write passages. Passages are woven into narration and reflection across the app.")
 
-    # Add new entry
+    # --- Upload Files ---
+    uploaded = st.file_uploader("Upload .txt, .pdf, .docx",
+                                type=["txt", "pdf", "docx"])
+    if uploaded:
+        st.info(f"Processing: {uploaded.name}")
+        process_upload(conn, uploaded, profile_id, api_key, use_ai, narration_length)
+        st.success("Passages saved into Lens (chunked).")
+
+    # --- Manual Entry ---
     with st.expander("➕ Add Lens Entry"):
-        lens_text = st.text_area("Text / Quote / Reflection")
-        category = st.text_input("Category (optional)")
-        source = st.text_input("Source (optional)")
+        text = st.text_area("Text / Quote / Reflection")
+        category = st.text_input("Category (optional)", "general")
+        source = st.text_input("Source (optional)", "manual")
         if st.button("Save Entry"):
-            if lens_text.strip():
-                add_lens_entry(conn, profile_id, lens_text.strip(), category.strip(), source.strip())
-                st.success("Entry added to Lens.")
+            if text:
+                conn.execute(
+                    "INSERT INTO lens (profile_id, text, category, source, created_at, active) "
+                    "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1)",
+                    (profile_id, text, category, source)
+                )
+                conn.commit()
+                st.success("Passage added.")
 
-    # Show entries
-    entries = get_lens_entries(conn, profile_id)
-    for eid, text, category, source, active in entries:
-        st.write(f"**{category or 'General'}** — {source or 'Unknown'}")
-        st.caption(text)
-        st.toggle("Active", value=bool(active), key=f"lens_active_{eid}")
-        st.divider()
+    # --- Manual Summarization ---
+    if st.button("Summarize Active Lens Entries"):
+        c = conn.cursor()
+        c.execute("SELECT text FROM lens WHERE profile_id=? AND active=1", (profile_id,))
+        texts = [row[0] for row in c.fetchall()]
+
+        if not texts:
+            st.warning("No active entries to summarize.")
+        else:
+            if use_ai and api_key:
+                style = get_narration_style(narration_length)
+                combined = "\n".join(texts[-5:])
+                prompt = (
+                    f"Here are passages from the Lens:\n\n{combined}\n\n"
+                    f"Summarize the meaning or themes in TimeSculpt's tone. {style}"
+                )
+                summary = ai_narrate(prompt, api_key)
+                if summary:
+                    st.success("AI Summary (inactive by default):")
+                    st.info(summary)
+                    save_summary_to_lens(conn, profile_id, summary, source="manual-summary")
+            else:
+                fallback = keyword_summary(texts, top_n=20)
+                st.success("Keyword Summary (inactive by default):")
+                st.info(fallback)
+                save_summary_to_lens(conn, profile_id, fallback, source="manual-summary")
+
+    # --- Search + Display ---
+    st.subheader("🔍 Search Lens")
+    search = st.text_input("Enter keyword(s)")
+    if search:
+        rows = conn.execute(
+            "SELECT text, category, source, active FROM lens WHERE profile_id=? AND text LIKE ? ORDER BY created_at DESC",
+            (profile_id, f"%{search}%")
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT text, category, source, active FROM lens WHERE profile_id=? ORDER BY created_at DESC",
+            (profile_id,)
+        ).fetchall()
+
+    if rows:
+        for text, cat, src, active in rows:
+            st.markdown(f"**{cat}** ({src})")
+            st.write(text)
+            st.toggle("Active", value=bool(active), key=f"lens_active_{hash(text)}")
+            st.markdown("---")
+    else:
+        st.info("No passages found.")
+
+
 
 
 # ======================
@@ -698,7 +914,7 @@ def update_profile_ai(conn, profile_id: int, api_key: str, use_ai: bool):
     conn.commit()
 
 def main():
-    st.title("⏳ TimeSculpt Navigator 6.4")
+    st.title("⏳ TimeSculpt")
 
     conn = get_connection()
     migrate(conn)
